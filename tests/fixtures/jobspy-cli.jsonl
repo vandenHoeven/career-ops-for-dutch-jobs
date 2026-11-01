@@ -1,0 +1,3 @@
+{"site":"indeed","id":"in-abc123","job_url":"https://nl.indeed.com/viewjob?jk=abc123","job_url_direct":"https://careers.example.nl/jobs/42/apply","title":"Data Analyst","company":"Example Analytics B.V.","location":"Amsterdam, Netherlands","date_posted":"2026-10-29","job_type":"fulltime","is_remote":false,"description":"<p>Analyseer data met SQL en Python.</p>"}
+{"site":"glassdoor","id":"gd-987","job_url":"https://www.glassdoor.nl/job-listing/data-scientist-JV_IC3064478_KO0,14.htm?jl=987","title":"Data Scientist","company":"Canal AI","location":"Utrecht, Netherlands","date_posted":"2026-10-30","is_remote":true,"description":"Build machine learning models."}
+

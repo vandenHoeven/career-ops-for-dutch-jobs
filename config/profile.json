@@ -1,0 +1,380 @@
+{
+  "country": "Netherlands",
+  "countryAliases": [
+    "netherlands",
+    "nederland",
+    "the netherlands",
+    "nl",
+    "holland",
+    "amsterdam",
+    "rotterdam",
+    "utrecht",
+    "den haag",
+    "the hague",
+    "eindhoven",
+    "tilburg",
+    "groningen",
+    "almere",
+    "breda",
+    "nijmegen",
+    "apeldoorn",
+    "haarlem",
+    "arnhem",
+    "enschede",
+    "amersfoort",
+    "zwolle",
+    "leiden",
+    "maastricht",
+    "delft",
+    "den bosch",
+    "s hertogenbosch",
+    "hoofddorp",
+    "noord holland",
+    "zuid holland",
+    "north holland",
+    "south holland",
+    "noord brabant",
+    "north brabant",
+    "gelderland",
+    "overijssel",
+    "limburg",
+    "friesland",
+    "fryslan",
+    "drenthe",
+    "flevoland",
+    "zeeland",
+    "groningen"
+  ],
+  "remoteAliases": [
+    "remote - netherlands",
+    "remote netherlands",
+    "netherlands remote",
+    "remote, nl"
+  ],
+  "roleFamilies": {
+    "data-science": [
+      "data scientist",
+      "data science",
+      "datawetenschapper"
+    ],
+    "machine-learning": [
+      "machine learning engineer",
+      "ml engineer",
+      "mlops",
+      "ai engineer",
+      "machine learning ontwikkelaar",
+      "ai ontwikkelaar",
+      "ai software engineer",
+      "machine learning scientist",
+      "ai software ontwikkelaar",
+      "machine learning onderzoeker"
+    ],
+    "operations-research": [
+      "operations research",
+      "operational research",
+      "optimization engineer",
+      "optimisation engineer",
+      "algorithm engineer",
+      "optimalisatie specialist",
+      "algoritme engineer"
+    ],
+    "quantitative": [
+      "quantitative analyst",
+      "quant analyst",
+      "quantitative researcher",
+      "kwantitatief analist",
+      "kwantitatief onderzoeker",
+      "quantitative developer",
+      "quant developer",
+      "kwantitatief ontwikkelaar"
+    ],
+    "data-analytics": [
+      "data analyst",
+      "decision scientist",
+      "data analist",
+      "informatie analist",
+      "analytics engineer",
+      "analytics engineering",
+      "business intelligence analyst",
+      "business intelligence analist"
+    ],
+    "research": [
+      "research scientist",
+      "applied scientist",
+      "onderzoeker data",
+      "wetenschappelijk onderzoeker"
+    ],
+    "model-risk": [
+      "model validation",
+      "model risk",
+      "risk modeller",
+      "risk modeler",
+      "modelvalidatie",
+      "model risico",
+      "risk model oversight",
+      "model validator",
+      "modelvalidatie specialist"
+    ]
+  },
+  "excludeTitleTerms": [
+    "intern",
+    "internship",
+    "stage",
+    "student",
+    "trainee"
+  ],
+  "preferredRoleFamilies": [
+    "ai-engineer",
+    "data-science",
+    "machine-learning",
+    "operations-research",
+    "quantitative",
+    "data-analytics",
+    "model-risk"
+  ],
+  "acceptableRoleFamilies": [
+    "research"
+  ],
+  "technicalEvidenceTerms": {
+    "data-science": [
+      "machine learning",
+      "statistics",
+      "statistiek",
+      "predictive",
+      "data modelling",
+      "data modeling"
+    ],
+    "machine-learning": [
+      "machine learning",
+      "mlops",
+      "deep learning",
+      "model deployment",
+      "computer vision",
+      "natural language processing"
+    ],
+    "operations-research": [
+      "optimization",
+      "optimisation",
+      "optimalisatie",
+      "operations research",
+      "mathematical programming",
+      "solver"
+    ],
+    "quantitative": [
+      "quantitative",
+      "kwantitatief",
+      "econometrics",
+      "econometrie",
+      "statistical modelling"
+    ],
+    "data-analytics": [
+      "data analysis",
+      "data analyse",
+      "analytics",
+      "business intelligence",
+      "sql",
+      "dashboard"
+    ],
+    "research": [
+      "data",
+      "statistiek",
+      "statistics",
+      "machine learning",
+      "ai",
+      "model",
+      "python",
+      "econometr",
+      "kwantitat",
+      "algorithm"
+    ],
+    "model-risk": [
+      "model validation",
+      "modelvalidatie",
+      "model risk",
+      "credit risk",
+      "risk model"
+    ]
+  },
+  "descriptionRoleTerms": {
+    "data-science": [
+      "data science",
+      "data scientist",
+      "predictive modelling",
+      "predictive modeling"
+    ],
+    "machine-learning": [
+      "machine learning",
+      "ml engineering",
+      "artificial intelligence",
+      "kunstmatige intelligentie"
+    ],
+    "operations-research": [
+      "operations research",
+      "mathematical optimization",
+      "wiskundige optimalisatie",
+      "decision science"
+    ],
+    "quantitative": [
+      "quantitative analysis",
+      "kwantitatieve analyse",
+      "econometrics",
+      "econometrie"
+    ],
+    "data-analytics": [
+      "data analytics",
+      "data analysis",
+      "data analyse",
+      "business intelligence"
+    ],
+    "research": [
+      "applied research",
+      "toegepast onderzoek",
+      "scientific research",
+      "wetenschappelijk onderzoek"
+    ],
+    "model-risk": [
+      "model validation",
+      "modelvalidatie",
+      "model risk"
+    ]
+  },
+  "broadCandidateTitleTerms": [
+    "analyst",
+    "analist",
+    "researcher",
+    "onderzoeker",
+    "scientist",
+    "engineer",
+    "ontwikkelaar",
+    "specialist",
+    "econometrist",
+    "modelleur",
+    "consultant",
+    "adviseur",
+    "developer",
+    "modeller",
+    "modeler",
+    "quant",
+    "analytics",
+    "data",
+    "ai",
+    "ml",
+    "postdoc",
+    "postdoctoral",
+    "professor",
+    "doctoral"
+  ],
+  "structuredRoleTerms": {
+    "data-science": [
+      "data science",
+      "data and analytics"
+    ],
+    "machine-learning": [
+      "machine learning",
+      "artificial intelligence"
+    ],
+    "operations-research": [
+      "operations research",
+      "optimization"
+    ],
+    "quantitative": [
+      "quantitative",
+      "econometrics"
+    ],
+    "data-analytics": [
+      "analytics",
+      "business intelligence"
+    ],
+    "research": [
+      "research",
+      "science"
+    ],
+    "model-risk": [
+      "risk",
+      "model validation"
+    ]
+  },
+  "minimumDescriptionTechnicalEvidence": 1,
+  "skills": [
+    {
+      "term": "python",
+      "weight": 5
+    },
+    {
+      "term": "machine learning",
+      "weight": 5
+    },
+    {
+      "term": "data analysis",
+      "weight": 4
+    },
+    {
+      "term": "statistics",
+      "weight": 4
+    },
+    {
+      "term": "optimization",
+      "weight": 3
+    },
+    {
+      "term": "sql",
+      "weight": 3
+    }
+  ],
+  "desiredSeniority": [
+    "junior",
+    "mid",
+    "unspecified"
+  ],
+  "excludedSeniority": [
+    "senior"
+  ],
+  "languages": [
+    "english",
+    "dutch",
+    "nederlands"
+  ],
+  "preferredLocations": [
+    "den bosch",
+    "utrecht",
+    "eindhoven"
+  ],
+  "locationPreferences": {
+    "anchor": {
+      "city": "'s-Hertogenbosch",
+      "aliases": [
+        "Den Bosch",
+        "s-Hertogenbosch",
+        "'s-Hertogenbosch"
+      ],
+      "latitude": 51.6978,
+      "longitude": 5.3037
+    },
+    "stronglyPreferredCities": [
+      "'s-Hertogenbosch",
+      "Den Bosch",
+      "Utrecht",
+      "Eindhoven"
+    ],
+    "nearbyCities": [
+      "Vught",
+      "Rosmalen",
+      "Boxtel",
+      "Oss",
+      "Tilburg",
+      "Waalwijk",
+      "Veghel",
+      "Zaltbommel"
+    ],
+    "distanceBandKm": 60,
+    "includeRestOfNetherlands": true,
+    "foreignLocations": "exclude"
+  },
+  "preferredWorkArrangements": [
+    "hybrid",
+    "remote"
+  ],
+  "dealBreakers": [],
+  "negativeTerms": [],
+  "expiryAfterMissedScans": 3
+}

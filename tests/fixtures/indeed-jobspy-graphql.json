@@ -1,0 +1,37 @@
+{
+  "data": {
+    "jobSearch": {
+      "pageInfo": { "nextCursor": "cursor-page-2" },
+      "results": [
+        {
+          "job": {
+            "key": "abc123def456",
+            "title": "Data Analyst",
+            "sourceEmployerName": "Example Analytics",
+            "dateOnIndeed": 1793232000000,
+            "description": { "html": "<p>Bouw dashboards en analyseer data met SQL en Python.</p>" },
+            "location": { "countryCode": "NL", "admin1Code": "NH", "city": "Amsterdam" },
+            "attributes": [{ "key": "CF3CP" }],
+            "compensation": { "baseSalary": { "unitOfWork": "MONTH", "range": { "min": 4200, "max": 5200 } }, "currencyCode": "EUR", "estimated": null },
+            "employer": { "name": "Example Analytics B.V." },
+            "recruit": { "viewJobUrl": "https://careers.example.nl/jobs/REQ-42/apply" }
+          }
+        },
+        {
+          "job": {
+            "key": "fed654cba321",
+            "title": "Machine Learning Engineer",
+            "sourceEmployerName": "Canal AI",
+            "dateOnIndeed": 1793318400000,
+            "description": { "html": "<p>Ontwikkel machine-learningmodellen met Python en cloud tooling.</p>" },
+            "location": { "countryCode": "NL", "admin1Code": "UT", "city": "Utrecht" },
+            "attributes": [],
+            "compensation": { "baseSalary": null, "currencyCode": null, "estimated": null },
+            "employer": null,
+            "recruit": { "viewJobUrl": "https://nl.indeed.com/viewjob?jk=fed654cba321" }
+          }
+        }
+      ]
+    }
+  }
+}

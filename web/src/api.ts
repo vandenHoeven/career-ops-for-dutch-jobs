@@ -1,0 +1,3 @@
+export async function api<T=any>(path:string,init?:RequestInit):Promise<T>{const response=await fetch(path,{...init,headers:{"content-type":"application/json",...init?.headers}});const data=await response.json().catch(()=>({}));if(!response.ok)throw new Error(data.error??`Request failed (${response.status})`);return data}
+export const date=(value?:string|null)=>value?new Intl.DateTimeFormat("en-NL",{day:"numeric",month:"short",year:"numeric"}).format(new Date(value)):"—";
+export const stages=["saved","preparing","applied","screening","interview","assessment","offer","hired","rejected","withdrawn"];

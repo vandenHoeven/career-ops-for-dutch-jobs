@@ -1,0 +1,8 @@
+.job-table th:last-child,
+.job-table td:last-child {
+  min-width: 70px;
+}
+
+.row-actions {
+  white-space: nowrap;
+}

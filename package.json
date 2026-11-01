@@ -1,0 +1,41 @@
+{
+  "name": "diego-career-ops",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "bin": {
+    "diego-career-ops": "dist/src/cli.js"
+  },
+  "scripts": {
+    "dev": "npm run build --silent && node --env-file-if-exists=.env.local dist/src/cli.js",
+    "dev:api": "npm run build --silent && node --env-file-if-exists=.env.local dist/src/cli.js serve",
+    "build:server": "tsc -p tsconfig.json",
+    "build:web": "vite build --config web/vite.config.ts",
+    "build": "npm run build:server && npm run build:web",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p web/tsconfig.json --noEmit",
+    "test": "npm run build:server --silent && node --test dist/tests/*.test.js",
+    "test:web": "vitest run --config web/vite.config.ts",
+    "poc:linkedin": "node scripts/linkedin-guest-poc.mjs",
+    "start": "node --env-file-if-exists=.env.local dist/src/cli.js serve"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "@types/react": "^19.1.0",
+    "@types/react-dom": "^19.1.0",
+    "@vitejs/plugin-react": "^4.4.1",
+    "jsdom": "^26.1.0",
+    "typescript": "^5.8.3",
+    "vite": "^6.1.0",
+    "vitest": "^5.0.5"
+  },
+  "dependencies": {
+    "devalue": "^5.5.0",
+    "playwright": "^1.63.0",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "react-router-dom": "^7.5.0"
+  }
+}

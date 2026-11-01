@@ -1,0 +1,114 @@
+[
+  {
+    "id": "adyen",
+    "careersUrl": "https://job-boards.greenhouse.io/adyen",
+    "provider": "greenhouse",
+    "evidenceUrl": "https://kalebconfer-sys.github.io/job-board-directory/job-board-directory.json",
+    "verifiedAt": "2026-10-29T23:05:40.818Z",
+    "verification": "Exact employer identity or official-site link plus successful public vacancy retrieval"
+  },
+  {
+    "id": "elastic",
+    "careersUrl": "https://job-boards.greenhouse.io/elastic",
+    "provider": "greenhouse",
+    "evidenceUrl": "https://kalebconfer-sys.github.io/job-board-directory/job-board-directory.json",
+    "verifiedAt": "2026-10-29T23:05:51.258Z",
+    "verification": "Exact employer identity or official-site link plus successful public vacancy retrieval"
+  },
+  {
+    "id": "fugro",
+    "careersUrl": "https://fugro.wd3.myworkdayjobs.com/Careers",
+    "provider": "workday",
+    "evidenceUrl": "https://kalebconfer-sys.github.io/job-board-directory/job-board-directory.json",
+    "verifiedAt": "2026-10-29T23:00:23.171Z",
+    "verification": "Exact employer identity or official-site link plus successful public vacancy retrieval"
+  },
+  {
+    "id": "gemeente-middelburg",
+    "careersUrl": "https://www.middelburg.nl/vacature-beleidsmedewerker-cultuur",
+    "provider": "browser",
+    "evidenceUrl": "https://www.middelburg.nl/vacature-beleidsmedewerker-cultuur",
+    "verifiedAt": "2026-10-29T23:05:32.177Z",
+    "verification": "Exact employer identity or official-site link plus successful public vacancy retrieval"
+  },
+  {
+    "id": "ing",
+    "careersUrl": "https://ing.wd3.myworkdayjobs.com/ICSGBLCOR",
+    "provider": "workday",
+    "evidenceUrl": "https://kalebconfer-sys.github.io/job-board-directory/job-board-directory.json",
+    "verifiedAt": "2026-10-29T23:06:08.643Z",
+    "verification": "Exact employer identity or official-site link plus successful public vacancy retrieval"
+  },
+  {
+    "id": "mumc",
+    "careersUrl": "https://mumc.recruitee.com/",
+    "provider": "recruitee",
+    "evidenceUrl": "https://kalebconfer-sys.github.io/job-board-directory/job-board-directory.json",
+    "verifiedAt": "2026-10-29T23:04:33.638Z",
+    "verification": "Exact employer identity or official-site link plus successful public vacancy retrieval"
+  },
+  {
+    "id": "medtronic-netherlands",
+    "careersUrl": "https://medtronic.wd1.myworkdayjobs.com/MedtronicCareers",
+    "provider": "workday",
+    "evidenceUrl": "https://medtronic.com",
+    "verifiedAt": "2026-10-29T23:05:06.386Z",
+    "verification": "Exact employer identity or official-site link plus successful public vacancy retrieval"
+  },
+  {
+    "id": "miro",
+    "careersUrl": "https://jobs.ashbyhq.com/miro",
+    "provider": "ashby",
+    "evidenceUrl": "https://kalebconfer-sys.github.io/job-board-directory/job-board-directory.json",
+    "verifiedAt": "2026-10-29T23:05:47.314Z",
+    "verification": "Exact employer identity or official-site link plus successful public vacancy retrieval"
+  },
+  {
+    "id": "mollie",
+    "careersUrl": "https://jobs.ashbyhq.com/mollie",
+    "provider": "ashby",
+    "evidenceUrl": "https://kalebconfer-sys.github.io/job-board-directory/job-board-directory.json",
+    "verifiedAt": "2026-10-29T23:05:47.314Z",
+    "verification": "Exact employer identity or official-site link plus successful public vacancy retrieval"
+  },
+  {
+    "id": "nxp-semiconductors",
+    "careersUrl": "https://nxp.wd3.myworkdayjobs.com/careers",
+    "provider": "workday",
+    "evidenceUrl": "https://nxp.com",
+    "verifiedAt": "2026-10-29T23:01:30.490Z",
+    "verification": "Exact employer identity or official-site link plus successful public vacancy retrieval"
+  },
+  {
+    "id": "nexperia",
+    "careersUrl": "https://nexperia.wd3.myworkdayjobs.com/careers",
+    "provider": "workday",
+    "evidenceUrl": "https://nexperia.com",
+    "verifiedAt": "2026-10-29T23:03:26.759Z",
+    "verification": "Exact employer identity or official-site link plus successful public vacancy retrieval"
+  },
+  {
+    "id": "optiver",
+    "careersUrl": "https://optiver.com/join-us/jobs/risk-finance-and-legal/chicago/compliance-intern-regulatory-advisory-2027-start/",
+    "provider": "browser",
+    "evidenceUrl": "https://optiver.com/join-us/jobs/risk-finance-and-legal/chicago/compliance-intern-regulatory-advisory-2027-start/",
+    "verifiedAt": "2026-10-29T23:05:40.818Z",
+    "verification": "Exact employer identity or official-site link plus successful public vacancy retrieval"
+  },
+  {
+    "id": "philips",
+    "careersUrl": "https://philips.wd3.myworkdayjobs.com/jobs-and-careers",
+    "provider": "workday",
+    "evidenceUrl": "https://kalebconfer-sys.github.io/job-board-directory/job-board-directory.json",
+    "verifiedAt": "2026-10-29T23:01:30.489Z",
+    "verification": "Exact employer identity or official-site link plus successful public vacancy retrieval"
+  },
+  {
+    "id": "tomtom",
+    "careersUrl": "https://jobs.eu.lever.co/tomtom",
+    "provider": "lever",
+    "evidenceUrl": "https://kalebconfer-sys.github.io/job-board-directory/job-board-directory.json",
+    "verifiedAt": "2026-10-29T23:05:47.314Z",
+    "verification": "Exact employer identity or official-site link plus successful public vacancy retrieval"
+  }
+]
