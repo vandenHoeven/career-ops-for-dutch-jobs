@@ -7,7 +7,7 @@ import { Store } from "./database.js";
 import { providerIds, resolveProvider } from "./providers.js";
 import { startDashboardApi } from "./dashboard-api.js";
 import { isProviderId, scan } from "./scanner.js";
-import { discover } from "./discovery.js";
+import { discover, validateDiscoveryMode, validateDiscoveryWorkers } from "./discovery.js";
 import { enrichJobs, enrichPendingJobs, rescoreJobs } from "./quality.js";
 
 const [command = "help", ...args] = process.argv.slice(2);
@@ -20,7 +20,7 @@ async function main(): Promise<void> {
     if (provider && !isProviderId(provider)) throw new Error(`Unknown provider '${provider}'. Use: ${providerIds.join(", ")}`);
     console.log(JSON.stringify(await scan({ provider, resume: args.includes("--resume") }), null, 2)); return;
   }
-  if (command === "discover") { console.log(JSON.stringify(await discover({ limit: Number(flag("--limit") ?? 100), source: flag("--source"), resume: args.includes("--resume"), retryFailures: args.includes("--retry-failures"), handleSignals: true, onProgress: message => console.error(message) }), null, 2)); return; }
+  if (command === "discover") { console.log(JSON.stringify(await discover({ limit: Number(flag("--limit") ?? 100), concurrency:validateDiscoveryWorkers(flag("--workers")), mode:validateDiscoveryMode(flag("--mode")), source: flag("--source"), resume: args.includes("--resume"), retryFailures: args.includes("--retry-failures"), handleSignals: true, onProgress: message => console.error(message) }), null, 2)); return; }
   if (command === "serve") { const port = Number(flag("--port") ?? process.env.PORT ?? 4310); startDashboardApi(port); return; }
   const store = new Store();
   try {
@@ -42,7 +42,7 @@ async function main(): Promise<void> {
       console.log(JSON.stringify({ ok: true, node: process.version, databasePath, enabledSources: sources.length, providers: [...new Set(sources.map(source => resolveProvider(source).id))], roleFamilies: Object.keys(profile.roleFamilies) }, null, 2)); return;
     }
   } finally { store.close(); }
-  console.log(`Diego Career Ops\n\nCommands:\n  recall-check [--file PATH] [--live]\n  discover [--limit N] [--source ID] [--resume] [--retry-failures]\n  discovery-failures [--retryable] [--source ID] [--limit N] [--include-missing] [--history]\n  scan [--provider ID] [--resume]\n  serve [--port 4310]\n  jobs [--search TEXT] [--company NAME] [--provider ID] [--role FAMILY] [--status STATUS]\n  employers [--name TEXT] [--headquarters VALUE] [--provider ID] [--board-status STATUS]\n  coverage\n  sources\n  stats\n  doctor`);
+  console.log(`Diego Career Ops\n\nCommands:\n  recall-check [--file PATH] [--live]\n  discover [--limit N] [--workers 1-8] [--mode balanced|fresh|refresh-known] [--source ID] [--resume] [--retry-failures]\n  discovery-failures [--retryable] [--source ID] [--limit N] [--include-missing] [--history]\n  scan [--provider ID] [--resume]\n  serve [--port 4310]\n  jobs [--search TEXT] [--company NAME] [--provider ID] [--role FAMILY] [--status STATUS]\n  employers [--name TEXT] [--headquarters VALUE] [--provider ID] [--board-status STATUS]\n  coverage\n  sources\n  stats\n  doctor`);
 }
 
 main().catch(error => { console.error(error instanceof Error ? error.message : error); process.exitCode = 1; });

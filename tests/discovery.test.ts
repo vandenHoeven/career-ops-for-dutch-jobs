@@ -142,8 +142,9 @@ test("bounded per-host concurrency and exact interrupted resume", async () => {
   try {
     const first = await discover({ limit: 5, store, sources: [source], context, concurrency: 4, signal: controller.signal });
     assert.equal(first.status, "interrupted"); assert.ok(first.processed <= 2); assert.ok(maximum <= 2);
-    const resumed = await discover({ limit: 5, store, sources: [source], context, concurrency: 4, resume: true });
+    const resumed = await discover({ limit: 5, store, sources: [source], context, concurrency: 8, resume: true });
     assert.equal(resumed.processed, 5); assert.equal((store.db.prepare("SELECT COUNT(*) count FROM discovery_attempts").get() as any).count, 5);
+    assert.equal((store.db.prepare("SELECT worker_count FROM discovery_runs WHERE id=?").get(first.id) as any).worker_count,4,"resume retains the worker count selected for the original run");
     assert.equal(sourceCalls, 1, "resume uses the persisted queue instead of reloading a changed source");
   } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
 });
@@ -158,6 +159,25 @@ test("discovery checkpoints each candidate without waiting for its slow batch pe
     assert.equal(observed,1,"the fast candidate is visible while its peer is still running");
     releaseSlow();const result=await running;assert.equal(result.processed,2);
   }finally{releaseSlow?.();store.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+test("six-worker scheduler refills a free slot while a slow candidate is still active",async()=>{
+  const dir=mkdtempSync(join(tmpdir(),"diego-six-workers-")),store=new Store(join(dir,"test.sqlite"));
+  const candidates=Array.from({length:7},(_,index)=>({sourceId:"pool-source",company:`Company ${index}`,provider:"browser" as const,boardUrl:`https://company-${index}.example.test/jobs`}));
+  const source:DiscoverySource={id:"pool-source",label:"Pool",license:"test",kind:"board-directory",async discover(){return {nextCursor:7,total:7,candidates};}};
+  let active=0,maximum=0,slowFinished=false,seventhStartedBeforeSlowFinished=false;
+  const context:FetchContext={fetchJson:async()=>({}),fetchText:async url=>{const value=String(url),slow=value.includes("company-0");active++;maximum=Math.max(maximum,active);if(value.includes("company-6")&&!slowFinished)seventhStartedBeforeSlowFinished=true;await new Promise(resolve=>setTimeout(resolve,slow?100:10));active--;if(slow)slowFinished=true;return "";}};
+  try{const result=await discover({limit:7,store,sources:[source],context,concurrency:6});assert.equal(result.processed,7);assert.ok(maximum<=6,"the six-worker setting bounds concurrent work");assert.ok(seventhStartedBeforeSlowFinished,"the seventh candidate starts when any worker frees");assert.equal((store.db.prepare("SELECT worker_count FROM discovery_runs WHERE id=?").get(result.id) as any).worker_count,6);}finally{store.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+test("Workday and Ashby retain one active collection per destination host",async()=>{
+  for(const provider of ["workday","ashby"] as const){
+    const dir=mkdtempSync(join(tmpdir(),`diego-${provider}-host-cap-`)),store=new Store(join(dir,"test.sqlite"));
+    const host=provider==="workday"?"tenant.myworkdayjobs.com":"jobs.ashbyhq.com",candidates=Array.from({length:4},(_,index)=>({sourceId:"host-cap",company:`Company ${index}`,provider,boardUrl:`https://${host}/External-${index}`}));
+    const source:DiscoverySource={id:"host-cap",label:"Host cap",license:"test",kind:"board-directory",async discover(){return {nextCursor:4,total:4,candidates};}};let active=0,maximum=0;
+    const context:FetchContext={fetchText:async()=>"",fetchJson:async()=>{active++;maximum=Math.max(maximum,active);await new Promise(resolve=>setTimeout(resolve,10));active--;return {total:0,jobPostings:[]};}};
+    try{const result=await discover({limit:4,store,sources:[source],context,concurrency:8});assert.equal(result.processed,4);assert.equal(maximum,1,`${provider} host requests remain serialized`);}finally{store.close();rmSync(dir,{recursive:true,force:true});}
+  }
 });
 
 test("stale running discoveries are recovered as interrupted", () => {

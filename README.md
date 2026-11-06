@@ -41,6 +41,9 @@ experimental Playwright browser fallback.
 npm run dev -- scan
 npm run dev -- discover
 npm run dev -- discover --limit 250
+npm run dev -- discover --limit 100 --workers 6
+npm run dev -- discover --mode fresh --limit 100
+npm run dev -- discover --mode refresh-known --limit 100
 npm run dev -- discover --source job-board-directory
 npm run dev -- discover --resume
 npm run dev -- discover --retry-failures --limit 50
@@ -74,6 +77,13 @@ active HTTP work and leaves unprocessed candidates pending. Retryable failures
 use increasing cooldowns (15 minutes, 1 hour, 6 hours, then 24 hours); missing
 boards are rechecked after seven days.
 
+Discovery modes are `balanced` (the default rotation and freshness windows),
+`fresh` (never-processed candidates only), and `refresh-known` (stored employer
+and ATS boards immediately, least-recently checked first). The dashboard shows
+source selection, active workers, enrichment targets, adaptive ETA ranges, and
+an expandable HTTP/processing trace. A candidate budget is a ceiling, not a
+promise that every source can supply that many eligible candidates.
+
 The final summary separates new and refreshed matching jobs, foreign-only
 boards, empty boards, missing boards, unsupported sources, pending candidates,
 and operational errors. HTTP 404 responses from ATS APIs are source-quality
@@ -100,6 +110,7 @@ The API listens only on `127.0.0.1:4310`:
 - `POST /api/v1/scans?provider=recruitee&resume=true`
 - `POST /api/v1/discovery?limit=100&source=job-board-directory&resume=true&retryFailures=false`
 - `GET /api/v1/discovery/runs/:id`
+- `GET /api/v1/discovery/runs/:id/trace?after=0&limit=200`
 - `POST /api/v1/discovery/runs/:id/cancel`
 
 Job filters include `company`, `roleFamily`, `provider`, `status`, `q`,
@@ -121,6 +132,10 @@ Employer filters include `name`, `headquarters`, `hiring`, `sizeBand`,
 - The default on-demand budget is 100 candidates: 50% benchmark/known Netherlands boards, 30% Dutch feeds, and 20% global directories. Unused capacity is redistributed. Known Netherlands boards refresh after 24 hours; foreign-only and unresolved employers after seven days. Persistent cursors and deduplicated board URLs prevent wasting budget.
 - Each candidate records an explainable result, request duration, job counts,
   HTTP status, retryability, and a sanitized failure reason.
+- Live runs distinguish fresh candidates, due rechecks, incomplete
+  continuations, forced refreshes, recently skipped candidates, and duplicates.
+  Technical traces retain at most 2,000 events per run and never store request
+  headers or response bodies.
 - `Ctrl+C` finishes active candidates, saves a heartbeat/checkpoint, and marks
   the run interrupted. `--resume` continues at the exact next candidate.
 - Discovery uses four workers by default, at most two per ATS hostname and one

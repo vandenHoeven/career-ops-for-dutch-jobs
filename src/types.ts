@@ -4,7 +4,7 @@ export type ProviderId =
 
 export type WorkArrangement = "onsite" | "hybrid" | "remote" | "unknown";
 export type JobStatus = "active" | "uncertain" | "expired";
-export type ReviewState = "new" | "reviewed" | "ignored";
+export type ReviewState = "new" | "reviewed" | "declined" | "archived";
 export type ApplicationStage = "saved" | "preparing" | "applied" | "screening" | "interview" | "assessment" | "offer" | "hired" | "rejected" | "withdrawn";
 export type EnrichmentStatus = "complete" | "unavailable" | "failed" | "not-needed";
 

@@ -21,6 +21,8 @@ describe('recall interface',()=>{
   const filter=container!.querySelector('.filter-grid select') as HTMLSelectElement;
   await act(async()=>{filter.value='possible';filter.dispatchEvent(new Event('change',{bubbles:true}));});
   expect(calls.at(-1)).toContain('matchState=possible');expect(calls.at(-1)).toContain('offset=0');
+  const amsterdam=[...container!.querySelectorAll('button')].find(button=>button.textContent==='Amsterdam only');expect(amsterdam).toBeDefined();
+  await act(async()=>amsterdam!.click());expect(calls.at(-1)).toContain('locationGroup=amsterdam');expect(calls.at(-1)).toContain('offset=0');
  });
 
  it('submits a vacancy URL and displays the persisted diagnostic outcome',async()=>{

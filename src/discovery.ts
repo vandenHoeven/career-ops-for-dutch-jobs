@@ -3,6 +3,7 @@ import { collectSource, checkpointCollection } from './collection.js';
 import { assessLocation } from './locations.js';
 import type { CollectionResult } from './types.js';
 import { createHash, randomUUID } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { resolve } from "node:path";
 import { dataDir, loadProfile } from "./config.js";
 import {
@@ -51,17 +52,28 @@ export interface DiscoverOptions {
   concurrency?: number;
   enrichmentLimit?:number;
   allocations?: DiscoveryAllocations;
+  mode?: DiscoveryRunMode;
 }
+export function validateDiscoveryWorkers(value: unknown): number {
+  if (value === undefined || value === null || value === "") return 6;
+  const workers = Number(value);
+  if (!Number.isInteger(workers) || workers < 1 || workers > 8) throw Object.assign(new Error("Discovery workers must be an integer from 1 to 8"), { statusCode: 400 });
+  return workers;
+}
+export type DiscoveryRunMode = "balanced" | "fresh" | "refresh-known";
+export function validateDiscoveryMode(value:unknown):DiscoveryRunMode {if(value===undefined||value===null||value==="")return "balanced";if(value==="balanced"||value==="fresh"||value==="refresh-known")return value;throw Object.assign(new Error("Discovery mode must be balanced, fresh, or refresh-known"),{statusCode:400});}
 export type DiscoveryCategory = "linkedin" | "jobspy" | "priority" | "native" | "directories";
 export type DiscoveryAllocations = Record<DiscoveryCategory, number>;
 export interface DiscoveryPlanSource {
   id: string; label: string; kind: DiscoverySource["kind"]; category: DiscoveryCategory;
   planned: number; enabled: boolean; status: "enabled" | "disabled" | "unauthorized";
   lastError?: string;
+  originalPlanned?: number; deprioritized?: boolean;
+  yieldEvidence?: { attempts: number; averageDurationMs: number; matchYield: number; reason: string };
 }
 export interface DiscoveryPlan {
   limit: number; allocations: DiscoveryAllocations; sources: DiscoveryPlanSource[];
-  rules: { redistribution: string; candidateMeaning: string };
+  rules: { redistribution: string; candidateMeaning: string; selectionPolicy: "strict" };
   scope?: { linkedin: { location: string; terms: string[]; strategy: string }; jobspy: { platforms: string[]; location: string; preferredCities: string[]; queries: string[]; broadQuery: string; hoursOld?: number; version: string } };
 }
 export interface DiscoverResult {
@@ -280,40 +292,16 @@ function hostLimit(candidate: DiscoveryCandidate): number {
     ? 1
     : 2;
 }
-function groups<T extends { candidate: DiscoveryCandidate }>(
-  items: T[],
-  concurrency: number,
-): T[][] {
-  const pending = [...items],
-    result: T[][] = [];
-  while (pending.length) {
-    const group: T[] = [],
-      hosts = new Map<string, number>();
-    for (
-      let index = 0;
-      index < pending.length && group.length < concurrency;
-
-    ) {
-      const item = pending[index],
-        host = destinationHost(item.candidate),
-        count = hosts.get(host) ?? 0;
-      if (count < hostLimit(item.candidate)) {
-        group.push(item);
-        hosts.set(host, count + 1);
-        pending.splice(index, 1);
-      } else index++;
-    }
-    if (!group.length) group.push(pending.shift()!);
-    result.push(group);
-  }
-  return result;
-}
-
 export function prioritySources(store:Store,sources:DiscoverySource[]):DiscoverySource[]{
  const rows=store.db.prepare(`SELECT eb.board_url,e.canonical_name company,eb.provider,eb.api_url FROM employer_boards eb JOIN employers e ON e.id=eb.employer_id WHERE EXISTS(SELECT 1 FROM vacancy_observations v WHERE v.employer_id=e.id) ORDER BY COALESCE(eb.last_checked_at,'') ASC`).all() as any[];
  const partials=store.db.prepare("SELECT candidate_json FROM collection_checkpoints WHERE state!='complete' AND cursor IS NOT NULL AND candidate_json IS NOT NULL ORDER BY last_checked_at").all() as any[];
  const candidates:DiscoveryCandidate[]=[...partials.map(r=>JSON.parse(r.candidate_json)),...rows.map(r=>({sourceId:'known-netherlands',company:r.company,boardUrl:r.board_url,provider:r.provider??'browser',apiUrl:r.api_url??undefined}))];
  return [...sources.filter(s=>s.id==='benchmark-employers'),{id:'known-netherlands',label:'Known Netherlands boards and pending collection',license:'Public employer sources',kind:'board-directory' as const,discover:async(_ctx:FetchContext,cursor:number,limit:number)=>({candidates:candidates.slice(cursor,cursor+limit),nextCursor:cursor+limit,total:candidates.length})},...sources.filter(s=>s.id!=='benchmark-employers')];
+}
+function refreshKnownSources(store:Store):DiscoverySource[]{
+ const rows=store.db.prepare(`SELECT eb.board_url,e.canonical_name company,eb.provider,eb.api_url FROM employer_boards eb JOIN employers e ON e.id=eb.employer_id WHERE eb.board_url IS NOT NULL ORDER BY COALESCE(eb.last_checked_at,'') ASC,e.canonical_name`).all() as any[];
+ const candidates:DiscoveryCandidate[]=rows.map(row=>({sourceId:"known-netherlands",company:row.company,boardUrl:row.board_url,provider:row.provider??"browser",apiUrl:row.api_url??undefined}));
+ return [{id:"known-netherlands",label:"Known employer and ATS boards",license:"Public employer sources",kind:"board-directory",discover:async(_context,cursor,limit)=>({candidates:candidates.slice(cursor,cursor+limit),nextCursor:cursor+limit,total:candidates.length})}];
 }
 const categories:DiscoveryCategory[]=["linkedin","jobspy","priority","native","directories"];
 export function sourceCategory(source:Pick<DiscoverySource,"id"|"kind">):DiscoveryCategory{
@@ -342,13 +330,17 @@ function splitBudget(total:number,sources:DiscoverySource[]):Map<string,number>{
  const result=new Map<string,number>();if(!sources.length)return result;
  const counts=weightedCounts(total,sources.map(()=>1));sources.forEach((source,index)=>result.set(source.id,counts[index]));return result;
 }
-export function buildDiscoveryPlan(limit:number,sources:DiscoverySource[],requested?:Partial<DiscoveryAllocations>):DiscoveryPlan{
+export function buildDiscoveryPlan(limit:number,sources:DiscoverySource[],requested?:Partial<DiscoveryAllocations>,store?:Store,deprioritize=false):DiscoveryPlan{
  const allocations=validateDiscoveryAllocations(limit,requested),budgets=new Map<string,number>();
  for(const category of categories)for(const [id,count] of splitBudget(allocations[category],sources.filter(source=>sourceCategory(source)===category)))budgets.set(id,count);
- return {limit,allocations,sources:sources.map(source=>({id:source.id,label:source.label,kind:source.kind,category:sourceCategory(source),planned:budgets.get(source.id)??0,enabled:true,status:'enabled'})),rules:{redistribution:'Unused capacity is reassigned proportionally among sources that can still return candidates.',candidateMeaning:'A candidate is a job or employer board to investigate; it is not the same as a vacancy.'}};
+ const evidence=new Map<string,{attempts:number;averageDurationMs:number;matchYield:number;reason:string}>();
+ if(store&&deprioritize)for(const source of sources){const row=store.sourceYieldEvidence(source.id);if(row&&row.attempts>=50&&row.averageDurationMs>=2000&&row.matchYield<0.03)evidence.set(source.id,{...row,reason:'At least 50 attempts in 30 days, average duration ≥2s, and profile match yield below 3%'});}
+ const planSources=sources.map(source=>{const original=budgets.get(source.id)??0,poor=evidence.get(source.id);return {id:source.id,label:source.label,kind:source.kind,category:sourceCategory(source),planned:poor?Math.min(1,original):original,originalPlanned:original,deprioritized:Boolean(poor),yieldEvidence:poor,enabled:true,status:'enabled' as const};});
+ for(const category of categories){const rows=planSources.filter(row=>row.category===category),released=rows.reduce((sum,row)=>sum+(row.originalPlanned??row.planned)-row.planned,0),healthy=rows.filter(row=>!row.deprioritized);if(released&&healthy.length){const shares=weightedCounts(released,healthy.map(row=>Math.max(1,row.originalPlanned??row.planned)));healthy.forEach((row,index)=>row.planned+=shares[index]);}}
+ return {limit,allocations,sources:planSources,rules:{selectionPolicy:'strict',redistribution:'Unused capacity is reassigned only within categories whose allocation is above zero. A zero allocation excludes that category, and the run may finish below its budget.',candidateMeaning:'A candidate is a job or employer board to investigate; it is not the same as a vacancy.'}};
 }
 export async function discoveryPlanForUi(store:Store,limit:number):Promise<DiscoveryPlan>{
- const sources=prioritySources(store,getDiscoverySources()),plan=buildDiscoveryPlan(limit,sources),profile=await loadProfile(),rows=store.discoverySourceRows() as any[],health=new Map(rows.map(row=>[row.id,row]));
+ const sources=prioritySources(store,getDiscoverySources()),plan=buildDiscoveryPlan(limit,sources,undefined,store,true),profile=await loadProfile(),rows=store.discoverySourceRows() as any[],health=new Map(rows.map(row=>[row.id,row]));
  for(const row of plan.sources)row.lastError=health.get(row.id)?.last_error??undefined;
  const linkedinEnabled=sources.some(source=>source.id==='linkedin-guest');
  if(!linkedinEnabled)plan.sources.push({id:'linkedin-guest',label:'LinkedIn Guest (EXPERIMENTAL)',kind:'job-feed',category:'linkedin',planned:0,enabled:false,status:process.env.DIEGO_ENABLE_LINKEDIN_GUEST==='true'?'unauthorized':'disabled'});
@@ -359,9 +351,9 @@ export async function discoveryPlanForUi(store:Store,limit:number):Promise<Disco
  plan.scope={linkedin:{location:process.env.DIEGO_LINKEDIN_GUEST_LOCATION??'Netherlands',terms,strategy:'Up to 10 newest results, then saved continuation.'},jobspy:{platforms:sources.filter(source=>source.id.startsWith('jobspy-')).map(source=>source.id.slice(7)),location:process.env.DIEGO_JOBSPY_LOCATION??'Netherlands',preferredCities:(process.env.DIEGO_JOBSPY_PREFERRED_CITIES?.split(';').map(value=>value.trim()).filter(Boolean)??jobSpyPreferredCitiesFromProfile(profile)),queries:explicitQueries?.length?explicitQueries:explicitQuery?[explicitQuery]:jobSpyQueriesFromProfile(profile),broadQuery:explicitQuery??jobSpyQueryFromProfile(profile),hoursOld:Number(process.env.DIEGO_JOBSPY_HOURS_OLD)||undefined,version:JOBSPY_VERSION}};
  return plan;
 }
-export async function buildQueue(id:string,limit:number,sources:DiscoverySource[],store:Store,context:FetchContext,timeoutMs:number,signal:AbortSignal|undefined,progress:(message:string)=>void,weighted=false,plan?:DiscoveryPlan):Promise<number>{
- if(plan)return buildPlannedQueue(id,limit,sources,store,context,timeoutMs,signal,progress,plan);
- const selected=new Map<string,DiscoveryCandidate>(),cursors=new Map(sources.map(s=>[s.id,s.id==='known-netherlands'?0:store.discoveryCursor(s.id)])),exhausted=new Set<string>();
+export async function buildQueue(id:string,limit:number,sources:DiscoverySource[],store:Store,context:FetchContext,timeoutMs:number,signal:AbortSignal|undefined,progress:(message:string)=>void,weighted=false,plan?:DiscoveryPlan,mode:DiscoveryRunMode="balanced"):Promise<number>{
+ if(plan)return buildPlannedQueue(id,limit,sources,store,context,timeoutMs,signal,progress,plan,mode);
+ const selected=new Map<string,DiscoveryCandidate>(),cursors=new Map(sources.map(s=>[s.id,s.id==='known-netherlands'?0:store.discoveryCursor(s.id)])),exhausted=new Set<string>(),composition={fresh:0,recheck:0,continuation:0,forcedRefresh:0,skippedRecent:0};
  const category=(s:DiscoverySource)=>['benchmark-employers','known-netherlands'].includes(s.id)?0:s.kind==='job-feed'?1:2;
  const quotas=weighted?[Math.ceil(limit*.5),Math.floor(limit*.3),limit-Math.ceil(limit*.5)-Math.floor(limit*.3)]:[limit,limit,limit],used=[0,0,0];
  let errors=0,overflow=false;
@@ -374,14 +366,15 @@ export async function buildQueue(id:string,limit:number,sources:DiscoverySource[
    const peers=sources.filter(s=>category(s)===group).length;
    const request=Math.min(limit-selected.size,allowance,Math.max(1,Math.ceil((weighted?quotas[group]:limit)/peers))),cursor=cursors.get(source.id)??0;
    try{
+    store.updateDiscoveryPhase(id,"querying-sources",`Querying ${source.label}`);store.recordDiscoveryEvent(id,{phase:"querying-sources",type:"source-query",sourceId:source.id,cursor,message:`Requested up to ${request} candidates from ${source.label}`});
     const batch=await bounded(timeoutMs,signal,active=>source.discover(signaledContext(context,active),cursor,request));
     for(const candidate of batch.candidates){
      if(weighted&&candidate.benchmarkId&&!store.benchmarkBoardNeedsCheck(candidate.benchmarkId))continue;
-     if(weighted&&!store.candidateDue(candidate))continue;
+     let disposition=store.candidateDisposition(candidate,mode);if(disposition==="skipped-recent"){if(weighted||mode!=="balanced"){composition.skippedRecent++;continue;}disposition="recheck";}
      const key=candidate.boardUrl&&!candidate.jobs?'board:'+canonicalizeUrl(candidate.boardUrl):candidateId(candidate);
      const prior=selected.get(key);
      if(prior){prior.contributingSources=[...new Set([...(prior.contributingSources??[prior.sourceId]),candidate.sourceId])];continue;}
-     if(selected.size<limit){candidate.contributingSources=[candidate.sourceId];selected.set(key,candidate);used[group]++;addedRound++;}
+     if(selected.size<limit){candidate.contributingSources=[candidate.sourceId];selected.set(key,candidate);composition[disposition==="forced-refresh"?"forcedRefresh":disposition]++;used[group]++;addedRound++;}
     }
     cursors.set(source.id,batch.nextCursor);store.updateDiscoverySource(source.id,batch.nextCursor,batch.total,batch.candidates.length);
     if(!batch.candidates.length||batch.nextCursor===cursor||(batch.total!==undefined&&batch.total<=batch.candidates.length))exhausted.add(source.id);
@@ -392,42 +385,51 @@ export async function buildQueue(id:string,limit:number,sources:DiscoverySource[
  }
  const ranked=[...selected.values()].sort((a,b)=>store.candidateLastChecked(a).localeCompare(store.candidateLastChecked(b)));
  store.enqueueDiscoveryCandidates(id,ranked.map(candidate=>({id:candidateId(candidate),candidate})));
+ store.updateDiscoveryComposition(id,{queued:ranked.length,...composition});
  progress('Queued '+ranked.length+' unique candidates.');return errors;
 }
 
-async function buildPlannedQueue(id:string,limit:number,sources:DiscoverySource[],store:Store,context:FetchContext,timeoutMs:number,signal:AbortSignal|undefined,progress:(message:string)=>void,plan:DiscoveryPlan):Promise<number>{
- const selected=new Map<string,DiscoveryCandidate>(),cursors=new Map(sources.map(s=>[s.id,s.id==='known-netherlands'?0:store.discoveryCursor(s.id)])),exhausted=new Set<string>(),accepted=new Map<string,number>(),duplicates=new Map<string,number>(),reassigned=new Map<string,number>();
- const planned=new Map(plan.sources.map(row=>[row.id,row.planned])),sourceById=new Map(sources.map(source=>[source.id,source]));let errors=0;
+async function buildPlannedQueue(id:string,limit:number,sources:DiscoverySource[],store:Store,context:FetchContext,timeoutMs:number,signal:AbortSignal|undefined,progress:(message:string)=>void,plan:DiscoveryPlan,mode:DiscoveryRunMode):Promise<number>{
+ const planned=new Map(plan.sources.map(row=>[row.id,row.planned])),selectedSources=sources.filter(source=>(planned.get(source.id)??0)>0);
+ const selected=new Map<string,DiscoveryCandidate>(),cursors=new Map(selectedSources.map(s=>[s.id,s.id==='known-netherlands'?0:store.discoveryCursor(s.id)])),exhausted=new Set<string>(),exhaustionTraced=new Set<string>(),accepted=new Map<string,number>(),duplicates=new Map<string,number>(),reassigned=new Map<string,number>(),fresh=new Map<string,number>(),recheck=new Map<string,number>(),continuation=new Map<string,number>(),forcedRefresh=new Map<string,number>(),skippedRecent=new Map<string,number>(),requested=new Map<string,number>(),returned=new Map<string,number>();
+ const sourceById=new Map(selectedSources.map(source=>[source.id,source]));let errors=0;
  store.saveDiscoveryPlan(id,plan);
  const collect=async(source:DiscoverySource,wanted:number,extra=false)=>{
   let added=0,rounds=0;
   while(added<wanted&&!exhausted.has(source.id)&&selected.size<limit&&!signal?.aborted&&rounds++<100){
-   const cursor=cursors.get(source.id)??0,request=Math.max(1,wanted-added);store.registerDiscoverySource(source);
+   const cursor=cursors.get(source.id)??0,request=Math.max(1,wanted-added);store.registerDiscoverySource(source);requested.set(source.id,(requested.get(source.id)??0)+request);
    try{
-    const batch=await bounded(timeoutMs,signal,active=>source.discover(signaledContext(context,active),cursor,request));let eligible=0;
+    store.updateDiscoveryPhase(id,"querying-sources",`Querying ${source.label}`);store.recordDiscoveryEvent(id,{phase:"querying-sources",type:"source-query",sourceId:source.id,cursor,message:`Requested up to ${request} candidates from ${source.label}`});
+    const batch=await bounded(timeoutMs,signal,active=>source.discover(signaledContext(context,active),cursor,request));returned.set(source.id,(returned.get(source.id)??0)+batch.candidates.length);let eligible=0;
     for(const candidate of batch.candidates){
-     if(candidate.benchmarkId&&!store.benchmarkBoardNeedsCheck(candidate.benchmarkId))continue;if(!store.candidateDue(candidate))continue;eligible++;
+     if(candidate.benchmarkId&&!store.benchmarkBoardNeedsCheck(candidate.benchmarkId)&&mode!=="refresh-known")continue;const disposition=store.candidateDisposition(candidate,mode);if(disposition==="skipped-recent"){skippedRecent.set(source.id,(skippedRecent.get(source.id)??0)+1);continue;}eligible++;
      const key=candidate.boardUrl&&!candidate.jobs?'board:'+canonicalizeUrl(candidate.boardUrl):candidateId(candidate),prior=selected.get(key);
      if(prior){prior.contributingSources=[...new Set([...(prior.contributingSources??[prior.sourceId]),candidate.sourceId])];duplicates.set(source.id,(duplicates.get(source.id)??0)+1);continue;}
-     if(selected.size<limit&&added<wanted){candidate.contributingSources=[candidate.sourceId];selected.set(key,candidate);added++;accepted.set(source.id,(accepted.get(source.id)??0)+1);if(extra)reassigned.set(source.id,(reassigned.get(source.id)??0)+1);}
+     if(selected.size<limit&&added<wanted){candidate.contributingSources=[candidate.sourceId];selected.set(key,candidate);added++;accepted.set(source.id,(accepted.get(source.id)??0)+1);const target=disposition==="fresh"?fresh:disposition==="recheck"?recheck:disposition==="continuation"?continuation:forcedRefresh;target.set(source.id,(target.get(source.id)??0)+1);if(extra)reassigned.set(source.id,(reassigned.get(source.id)??0)+1);}
     }
     cursors.set(source.id,batch.nextCursor);store.updateDiscoverySource(source.id,batch.nextCursor,batch.total,batch.candidates.length);
-    if(!batch.candidates.length||batch.nextCursor===cursor||(batch.total!==undefined&&batch.nextCursor>=batch.total)||(!eligible&&rounds>4))exhausted.add(source.id);
+    if(!batch.candidates.length||batch.nextCursor===cursor||(batch.total!==undefined&&batch.nextCursor>=batch.total)||(!eligible&&rounds>4&&mode==="balanced"))exhausted.add(source.id);
    }catch(error){errors++;const failure=classifyError(error);store.updateDiscoverySource(source.id,cursor,undefined,0,failure.message);exhausted.add(source.id);progress('['+source.id+'] '+failure.message);}
   }
-  store.updateDiscoveryPlanSource(id,source.id,{queued:accepted.get(source.id)??0,duplicates:duplicates.get(source.id)??0,reassigned:reassigned.get(source.id)??0,exhausted:exhausted.has(source.id)});return added;
+  if(exhausted.has(source.id)&&!exhaustionTraced.has(source.id)){exhaustionTraced.add(source.id);store.recordDiscoveryEvent(id,{phase:"querying-sources",type:"selected-source-exhausted",sourceId:source.id,message:`${source.label} exhausted: ${returned.get(source.id)??0} returned, ${skippedRecent.get(source.id)??0} recently skipped, ${duplicates.get(source.id)??0} duplicates merged, ${accepted.get(source.id)??0} queued`,metadata:{planned:planned.get(source.id)??0,returned:returned.get(source.id)??0,skippedRecent:skippedRecent.get(source.id)??0,duplicates:duplicates.get(source.id)??0,queued:accepted.get(source.id)??0}});}
+  store.updateDiscoveryPlanSource(id,source.id,{queued:accepted.get(source.id)??0,duplicates:duplicates.get(source.id)??0,reassigned:reassigned.get(source.id)??0,exhausted:exhausted.has(source.id),fresh:fresh.get(source.id)??0,recheck:recheck.get(source.id)??0,continuation:continuation.get(source.id)??0,forcedRefresh:forcedRefresh.get(source.id)??0,skippedRecent:skippedRecent.get(source.id)??0,cursor:cursors.get(source.id),requested:requested.get(source.id)??0,returned:returned.get(source.id)??0});return added;
  };
  for(const row of plan.sources){const source=sourceById.get(row.id);if(source&&row.planned>0)await collect(source,row.planned);}
  while(selected.size<limit){
-  const available=sources.filter(source=>!exhausted.has(source.id));if(!available.length)break;
+  const deprioritized=new Set(plan.sources.filter(row=>row.deprioritized).map(row=>row.id));
+  const available=selectedSources.filter(source=>!exhausted.has(source.id)&&!deprioritized.has(source.id));if(!available.length)break;
   const remaining=limit-selected.size,weights=available.map(source=>Math.max(1,planned.get(source.id)??0)),shares=weightedCounts(remaining,weights);let added=0;
   for(let index=0;index<available.length&&selected.size<limit;index++)added+=await collect(available[index],Math.max(1,shares[index]),true);
   if(!added)break;
  }
  const ranked=[...selected.values()].sort((a,b)=>store.candidateLastChecked(a).localeCompare(store.candidateLastChecked(b)));
  store.enqueueDiscoveryCandidates(id,ranked.map(candidate=>({id:candidateId(candidate),candidate})));
- for(const source of sources)store.updateDiscoveryPlanSource(id,source.id,{queued:accepted.get(source.id)??0,duplicates:duplicates.get(source.id)??0,reassigned:reassigned.get(source.id)??0,exhausted:exhausted.has(source.id)});
- progress(`Queued ${ranked.length} unique candidates with ${[...duplicates.values()].reduce((a,b)=>a+b,0)} duplicates merged.`);return errors;
+ for(const source of sources)store.updateDiscoveryPlanSource(id,source.id,{queued:accepted.get(source.id)??0,duplicates:duplicates.get(source.id)??0,reassigned:reassigned.get(source.id)??0,exhausted:exhausted.has(source.id),fresh:fresh.get(source.id)??0,recheck:recheck.get(source.id)??0,continuation:continuation.get(source.id)??0,forcedRefresh:forcedRefresh.get(source.id)??0,skippedRecent:skippedRecent.get(source.id)??0,cursor:cursors.get(source.id),requested:requested.get(source.id)??0,returned:returned.get(source.id)??0});
+ store.updateDiscoveryComposition(id,{queued:ranked.length,fresh:[...fresh.values()].reduce((a,b)=>a+b,0),recheck:[...recheck.values()].reduce((a,b)=>a+b,0),continuation:[...continuation.values()].reduce((a,b)=>a+b,0),forcedRefresh:[...forcedRefresh.values()].reduce((a,b)=>a+b,0),skippedRecent:[...skippedRecent.values()].reduce((a,b)=>a+b,0)});
+ const selectedRows=plan.sources.filter(row=>row.planned>0),shortfall=selectedRows.map(row=>({sourceId:row.id,label:row.label,category:row.category,planned:row.planned,returned:returned.get(row.id)??0,skippedRecent:skippedRecent.get(row.id)??0,duplicates:duplicates.get(row.id)??0,queued:accepted.get(row.id)??0,unfilled:Math.max(0,row.planned-(accepted.get(row.id)??0))})),returnedTotal=[...returned.values()].reduce((a,b)=>a+b,0),duplicateTotal=[...duplicates.values()].reduce((a,b)=>a+b,0),unfilled=Math.max(0,limit-ranked.length);
+ store.updateDiscoverySelectionSummary(id,{returned:returnedTotal,duplicates:duplicateTotal,unfilled,shortfall});
+ if(unfilled>0)store.recordDiscoveryEvent(id,{phase:"querying-sources",type:"strict-selection-underfilled",message:`Strict source selection queued ${ranked.length} of ${limit} requested; ${unfilled} slots remain unfilled and excluded sources will not run`,metadata:{requested:limit,returned:returnedTotal,queued:ranked.length,unfilled,shortfall}});
+ progress(`Strict source selection queued ${ranked.length} of ${limit} requested with ${duplicateTotal} duplicates merged and ${unfilled} unfilled slots.`);return errors;
 }
 
 export async function discover(
@@ -437,26 +439,29 @@ export async function discover(
     owned = !options.store,
     progress = options.onProgress ?? (() => {});
   const limit = Math.min(Math.max(options.limit ?? 100, 1), 5000),
-    timeoutMs = options.candidateTimeoutMs ?? 45_000,
-    concurrency = Math.min(Math.max(options.concurrency ?? 4, 1), 8);
+    timeoutMs = options.candidateTimeoutMs ?? 45_000;
   store.recoverStaleDiscoveryRuns();
-  const configuredSources=options.sources??(options.source?getDiscoverySources(options.source):prioritySources(store,getDiscoverySources()));
-  const requestedPlan=!options.sources&&!options.source?buildDiscoveryPlan(limit,configuredSources,options.allocations):undefined;
   const prior = options.resume
     ? store.incompleteDiscoveryRun(options.source)
     : null;
+  const concurrency = prior ? Math.min(Math.max(Number(prior.row.worker_count??4),1),8) : validateDiscoveryWorkers(options.concurrency);
+  const mode=prior?validateDiscoveryMode(prior.row.mode):validateDiscoveryMode(options.mode),configuredSources=options.sources??(mode==="refresh-known"?refreshKnownSources(store):options.source?getDiscoverySources(options.source):prioritySources(store,getDiscoverySources()));
+  const requestedPlan=!options.sources&&!options.source?buildDiscoveryPlan(limit,configuredSources,mode==="refresh-known"?{linkedin:0,jobspy:0,priority:limit,native:0,directories:0}:options.allocations,store,mode==="balanced"||mode==="fresh"):undefined;
   const id = prior?.id ?? options.runId ?? randomUUID(),
     scanId = `discovery-${id}`,
     started = Date.now();
   if (!prior) {
-    store.startDiscoveryRun(id, options.source, limit,requestedPlan);
+    store.startDiscoveryRun(id, options.source, limit,requestedPlan,mode,concurrency);
     store.startRun(scanId, "discovery");
   } else store.resumeDiscoveryRun(id);
+  store.recordDiscoveryEvent(id,{phase:"planning",type:prior?"run-resumed":"run-started",message:prior?`Resumed ${mode} discovery with its persisted queue`:`Started ${mode} discovery with a budget of ${limit}`});
+  const traceContext=new AsyncLocalStorage<{sourceId?:string;candidateId?:string;workerId?:string;phase:string}>();
   const context =
     options.context ??
     createHttpContext({
       cacheDir: resolve(dataDir, "cache/discovery"),
       cacheTtlMs: 30 * 60_000,
+      onEvent:event=>{try{const active=traceContext.getStore();store.recordDiscoveryEvent(id,{phase:active?.phase??"http",type:`http-${event.type}`,level:event.type==="error"?"error":"info",message:event.message??`${event.type} ${event.status??""}`.trim(),sourceId:active?.sourceId,candidateId:active?.candidateId,workerId:active?.workerId,url:event.url,attempt:event.attempt,httpStatus:event.status,durationMs:event.durationMs,metadata:event.retryAfterMs?{retryAfterMs:event.retryAfterMs}:undefined});}catch{/* Telemetry must never make a public-source request fail. */}},
     });
   const controller = new AbortController(),
     abort = () => {
@@ -502,6 +507,7 @@ export async function discover(
           progress,
           !options.sources && !options.source && !requestedPlan,
           requestedPlan,
+          mode,
         );
     }
     const profile = await loadProfile(),
@@ -537,6 +543,8 @@ export async function discover(
     counts.errors += sourceErrors;
     let enrichmentUsed = counts.enrichedJobs + counts.enrichmentFailures;
     const queue = store.discoveryQueue(id);
+    store.db.prepare("UPDATE discovery_runs SET queued_count=MAX(queued_count,?) WHERE id=?").run(counts.processed+queue.length,id);
+    store.updateDiscoveryPhase(id,"processing",`Processing ${queue.length} queued candidates with ${concurrency} workers`);
     progress(
       `Discovery ${id}: ${queue.length} pending, concurrency ${concurrency}, timeout ${Math.round(timeoutMs / 1000)}s.`,
     );
@@ -559,19 +567,16 @@ export async function discover(
       store.updateRecallCheckpoint(id,counts);
       progress(`${counts.processed} processed | ${counts.employers} employers | ${counts.newJobs} new jobs | ${counts.errors} errors`);
     };
-    for (const group of groups(queue, concurrency)) {
-      if (controller.signal.aborted) break;
-      const eligible = group.filter(
-        (item) => (circuit.get(destinationHost(item.candidate)) ?? 0) < 5,
-      );
-      if (!eligible.length) continue;
-      await Promise.all(
-        eligible.map(async (item) => {
+    const waiting=[...queue],active=new Set<Promise<any>>(),hostUse=new Map<string,number>(),availableSlots=Array.from({length:concurrency},(_,index)=>index+1);
+    const executeCandidate=(item:typeof queue[number],workerId:string):Promise<any>=>{
           const { candidateId: idValue } = item,
             startedAt = new Date().toISOString(),
             attemptStarted = Date.now(),
             key = destinationHost(item.candidate);
           const candidate = item.candidate;
+          store.startDiscoveryTask(id,idValue,workerId,candidate,"resolving-board","Resolving candidate and ATS provider");
+          store.recordDiscoveryEvent(id,{phase:"processing",type:"candidate-started",sourceId:candidate.sourceId,candidateId:idValue,workerId,url:candidate.boardUrl,message:`${workerId} started ${candidate.company} via ${candidate.provider??"embedded feed"}`});
+          return traceContext.run({phase:"processing",sourceId:candidate.sourceId,candidateId:idValue,workerId},async()=>{try{
           let result: DiscoveryAttemptResult = "invalid-record",
             retryable = false,
             status: number | undefined,
@@ -605,6 +610,7 @@ export async function discover(
                       await bounded(timeoutMs,signal,active=>benchmarkCandidate(signaledContext(activeContext,active),employer)),
                     );
                 }
+                store.updateDiscoveryTask(id,idValue,"fetching-vacancies",{detail:`Fetching vacancies from ${candidate.provider??"embedded feed"}`});
                 collection = await fetchCandidate(candidate, activeContext, store, signal, timeoutMs);
                 const fetched = collection.jobs, prepared: RawJob[] = [];
                 for (const job of fetched) {
@@ -621,9 +627,12 @@ export async function discover(
                       continue;
                     }
                     enrichmentUsed++;
+                    store.updateDiscoveryTask(id,idValue,"enriching-description",{detail:"Fetching job-specific description",jobTitle:job.title,jobUrl:job.url});
+                    store.recordDiscoveryEvent(id,{phase:"enriching",type:"enrichment-started",sourceId:candidate.sourceId,candidateId:idValue,workerId,url:job.url,message:`Enriching description for ${job.title}`});
                     const value = await limitEnrichment(job.url, signal, () =>
                       enrichJob(job, activeContext),
                     );
+                    store.recordDiscoveryEvent(id,{phase:"enriching",type:"enrichment-finished",level:value.status==="failed"?"error":"info",sourceId:candidate.sourceId,candidateId:idValue,workerId,url:job.url,message:`Description enrichment ${value.status}: ${job.title}`});
                     enrichment.set(job.url, {
                       status: value.status,
                       error: value.error,
@@ -645,6 +654,7 @@ export async function discover(
                 }
                 return prepared;
               })();
+            store.updateDiscoveryTask(id,idValue,"evaluating",{detail:`Evaluating ${jobs.length} fetched vacancies`});
             if (!jobs.length) result = "empty-board";
             else {
               nlJobs = jobs.filter((job) => isNetherlandsJob(job, profile));
@@ -690,6 +700,7 @@ export async function discover(
             continuation,
             candidate: normalizedCandidate,
           };
+          store.updateDiscoveryTask(id,idValue,"saving-results",{detail:`Saving ${jobs.length} vacancies and ${matches} matches`});
           store.transaction(() => {
             if (actualCompany.trim()) {
               employerId = store.upsertEmployer(
@@ -753,11 +764,26 @@ export async function discover(
             collectionPartial,
           };
           checkpointOutcome(outcome);
+          store.recordDiscoveryEvent(id,{phase:"processing",type:"candidate-completed",level:errorMessage?"error":"info",sourceId:candidate.sourceId,candidateId:idValue,workerId,url:candidate.boardUrl,durationMs:attempt.durationMs,httpStatus:status,message:`${actualCompany}: ${result}; ${jobs.length} fetched, ${matches} matches`,metadata:{provider:candidate.provider,netherlandsJobs:nlJobs.length,newJobs,refreshedJobs,error:errorMessage}});
           return outcome;
-        }),
-      );
+          }finally{store.finishDiscoveryTask(id,idValue);}});
+    };
+    while((waiting.length||active.size)&&!controller.signal.aborted){
+      let launched=false;
+      while(active.size<concurrency&&availableSlots.length){
+        const index=waiting.findIndex(item=>{const key=destinationHost(item.candidate);return (circuit.get(key)??0)<5&&(hostUse.get(key)??0)<hostLimit(item.candidate);});
+        if(index<0)break;
+        const [item]=waiting.splice(index,1),key=destinationHost(item.candidate),slot=availableSlots.shift()!,promise=executeCandidate(item,`worker-${slot}`);
+        hostUse.set(key,(hostUse.get(key)??0)+1);active.add(promise);launched=true;
+        const release=()=>{hostUse.set(key,Math.max(0,(hostUse.get(key)??1)-1));active.delete(promise);availableSlots.push(slot);};
+        void promise.then(release,release);
+      }
+      if(active.size)await Promise.race(active);
+      else if(!launched)break;
     }
-    const pending = store.pendingDiscoveryCount(id),
+    if(active.size)await Promise.all(active);
+    store.updateDiscoveryPhase(id,"finalizing","Finalizing counters and persisted run history");
+    const pending = store.pendingDiscoveryCount(id),selection=store.db.prepare("SELECT limit_count,queued_count,unfilled_count,selection_policy FROM discovery_runs WHERE id=?").get(id) as any,
       durationMs = Date.now() - started,
       interrupted = controller.signal.aborted;
     const status = interrupted
@@ -767,6 +793,7 @@ export async function discover(
         : counts.errors || counts.partialCollections
           ? "partial"
           : "completed";
+    store.recordDiscoveryEvent(id,{phase:"finalizing",type:"run-finished",level:counts.errors?"error":"info",message:`Discovery ${status}: ${counts.processed} processed of ${selection?.queued_count??counts.processed} queued (${selection?.limit_count??limit} requested), ${selection?.unfilled_count??0} unfilled, ${pending} pending, ${counts.newJobs} new jobs, ${counts.errors} errors`,durationMs,metadata:{selectionPolicy:selection?.selection_policy,requested:selection?.limit_count??limit,queued:selection?.queued_count??counts.processed,unfilled:selection?.unfilled_count??0}});
     store.finishDiscoveryRun(id, {
       status,
       ...counts,

@@ -12,7 +12,7 @@ import { processJob } from '../src/processing.js';
 import { hardExclusion } from '../src/scoring.js';
 import { collectSource, checkpointCollection } from '../src/collection.js';
 import { resolveProvider } from '../src/providers.js';
-import { buildDiscoveryPlan, buildQueue, defaultDiscoveryAllocations, discover, validateDiscoveryAllocations } from '../src/discovery.js';
+import { buildDiscoveryPlan, buildQueue, defaultDiscoveryAllocations, discover, validateDiscoveryAllocations, validateDiscoveryWorkers } from '../src/discovery.js';
 import { scan } from '../src/scanner.js';
 import { enrichPendingJobs, rescoreJobs } from '../src/quality.js';
 import { enrichJob } from '../src/enrichment.js';
@@ -20,7 +20,7 @@ import { HttpError } from '../src/http.js';
 import { createApi } from '../src/api.js';
 import { createDashboardApi } from '../src/dashboard-api.js';
 import { recallCheck } from '../src/recall.js';
-import type { RawJob, DiscoverySource, FetchContext } from '../src/types.js';
+import type { RawJob, DiscoveryAttempt, DiscoverySource, FetchContext } from '../src/types.js';
 
 const base:RawJob={title:'Data Scientist',company:'Example',location:'Vught',url:'https://example.test/jobs/1',raw:{}};
 const context:FetchContext={fetchJson:async()=>({}),fetchText:async()=>''};
@@ -166,6 +166,45 @@ test('transparent discovery plan reserves 25/25/25/15/10 and validates edits',()
  assert.throws(()=>validateDiscoveryAllocations(100,{...allocations,linkedin:24}),/totalling 100/);
 });
 
+test('worker counts validate and source yield policy redistributes only qualifying low-yield capacity',()=>{
+ const db=database();try{
+  assert.equal(validateDiscoveryWorkers(undefined),6);assert.equal(validateDiscoveryWorkers('8'),8);assert.throws(()=>validateDiscoveryWorkers(9),/1 to 8/);assert.throws(()=>validateDiscoveryWorkers(2.5),/integer/);
+  const now=new Date().toISOString();db.store.db.prepare("INSERT INTO discovery_runs(id,started_at,status,limit_count) VALUES(?,?,?,?)").run('history',now,'completed',100);
+  const record=db.store.db.prepare("INSERT INTO discovery_attempts(run_id,source_id,company,provider,started_at,duration_ms,result,retryable,jobs_fetched,netherlands_jobs,profile_matches,candidate_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)");
+  for(let index=0;index<50;index++)record.run('history','slow-low','Low yield','lever',now,3000,'no-netherlands-jobs',0,1,0,0,'{}');
+  for(let index=0;index<50;index++)record.run('history','slow-productive','Productive','workday',now,3000,'matched',0,1,1,1,'{}');
+  const sources:DiscoverySource[]=['slow-low','slow-productive'].map(id=>({id,label:id,license:'test',kind:'board-directory',discover:async()=>({candidates:[],nextCursor:0,total:0})}));
+  const allocations={linkedin:0,jobspy:0,priority:0,native:0,directories:10},plan=buildDiscoveryPlan(10,sources,allocations,db.store,true);
+  const low=plan.sources.find(row=>row.id==='slow-low')!,productive=plan.sources.find(row=>row.id==='slow-productive')!;
+  assert.equal(low.deprioritized,true);assert.equal(low.originalPlanned,5);assert.equal(low.planned,1);assert.equal(low.yieldEvidence?.attempts,50);assert.equal(productive.deprioritized,false);assert.equal(productive.planned,9);assert.equal(plan.sources.reduce((sum,row)=>sum+row.planned,0),10);
+  const regular=buildDiscoveryPlan(10,sources,allocations,db.store,false);assert.equal(regular.sources.find(row=>row.id==='slow-low')?.planned,5);
+ }finally{db.close();}
+});
+
+test('fresh and refresh-known modes classify repeat candidates transparently',async()=>{
+ const db=database();try{
+  const old={sourceId:'known-netherlands',company:'Seen company',provider:'greenhouse' as const,boardUrl:'https://job-boards.greenhouse.io/seen'},fresh={sourceId:'known-netherlands',company:'Fresh company',provider:'greenhouse' as const,boardUrl:'https://job-boards.greenhouse.io/fresh'};
+  const prior:DiscoveryAttempt={runId:'prior',sourceId:old.sourceId,company:old.company,provider:old.provider,boardUrl:old.boardUrl,startedAt:new Date().toISOString(),durationMs:100,result:'matched',retryable:false,jobsFetched:1,netherlandsJobs:1,profileMatches:1,candidate:old};
+  db.store.updateCandidateHealth('seen-candidate',prior);
+  const source:DiscoverySource={id:'known-netherlands',label:'Mode source',license:'test',kind:'board-directory',discover:async(_ctx,cursor,limit)=>({candidates:[old,fresh].slice(cursor,cursor+limit),nextCursor:Math.min(2,cursor+limit),total:2})};
+  db.store.startDiscoveryRun('fresh-run',undefined,2,undefined,'fresh');await buildQueue('fresh-run',2,[source],db.store,context,1000,undefined,()=>{},false,undefined,'fresh');
+  assert.deepEqual(db.store.discoveryQueue('fresh-run').map(row=>row.candidate.company),['Fresh company']);
+  const freshRun:any=db.store.discoveryRun('fresh-run');assert.equal(freshRun.fresh_candidate_count,1);assert.equal(freshRun.skipped_recent_count,1);assert.equal(freshRun.queued_count,1);
+  db.store.startDiscoveryRun('refresh-run',undefined,2,undefined,'refresh-known');await buildQueue('refresh-run',2,[source],db.store,context,1000,undefined,()=>{},false,undefined,'refresh-known');
+  assert.equal(db.store.discoveryQueue('refresh-run').length,2);const refreshRun:any=db.store.discoveryRun('refresh-run');assert.equal(refreshRun.forced_refresh_count,1);assert.equal(refreshRun.fresh_candidate_count,1);
+ }finally{db.close();}
+});
+
+test('run tasks and capped technical trace are exposed without request bodies or headers',()=>{
+ const db=database();try{
+  db.store.startDiscoveryRun('trace-run',undefined,1,undefined,'balanced');const candidate={sourceId:'trace-source',company:'Example',provider:'greenhouse' as const,boardUrl:'https://job-boards.greenhouse.io/example'};
+  db.store.startDiscoveryTask('trace-run','candidate','worker-1',candidate);db.store.updateDiscoveryTask('trace-run','candidate','enriching-description',{jobTitle:'Data Scientist',jobUrl:'https://example.test/job'});
+  for(let index=0;index<2005;index++)db.store.recordDiscoveryEvent('trace-run',{phase:'processing',type:'request',message:`event ${index}`,url:'https://example.test/jobs'});
+  const run:any=db.store.discoveryRun('trace-run');assert.equal(run.active_tasks[0].stage,'enriching-description');assert.ok(run.eta);
+  const trace:any=db.store.discoveryTrace('trace-run',0,500);assert.equal(trace.items.length,500);assert.equal(trace.items[0].url,'https://example.test/jobs');assert.equal(trace.droppedCount,5);
+ }finally{db.close();}
+});
+
 test('planned discovery visibly redistributes unused source capacity',async()=>{
  const db=database();try{
   db.store.startDiscoveryRun('planned',undefined,10);
@@ -175,6 +214,23 @@ test('planned discovery visibly redistributes unused source capacity',async()=>{
   await buildQueue('planned',10,sources,db.store,context,1000,undefined,()=>{},false,plan);
   assert.equal(db.store.discoveryQueue('planned').length,10);const rows=db.store.discoveryRunSources('planned') as any[],linkedin=rows.find(row=>row.source_id==='linkedin-guest');
   assert.equal(linkedin.planned_count,4);assert.equal(linkedin.reassigned_count,6);assert.equal(linkedin.queued_count,10);assert.ok(rows.filter(row=>row.source_id!=='linkedin-guest').every(row=>row.exhausted===1));
+ }finally{db.close();}
+});
+
+test('strict allocations never query zero-allocation sources when LinkedIn and Indeed are recent-only',async()=>{
+ const db=database();try{
+  const linkedin=Array.from({length:10},(_,index)=>({sourceId:'linkedin-guest',company:`LinkedIn ${index}`,jobs:[{...base,url:`https://linkedin.test/${index}`}]}));
+  const indeed=Array.from({length:72},(_,index)=>({sourceId:'jobspy-indeed',company:`Indeed ${index}`,jobs:[{...base,url:`https://indeed.test/${index}`}]}));
+  for(const candidate of [...linkedin,...indeed])db.store.updateCandidateHealth(`recent-${candidate.sourceId}-${candidate.company}`,{runId:'prior',sourceId:candidate.sourceId,company:candidate.company,startedAt:new Date().toISOString(),durationMs:1,result:'matched',retryable:false,jobsFetched:1,netherlandsJobs:1,profileMatches:1,candidate});
+  let excludedCalls=0;
+  const feed=(id:string,candidates:any[]):DiscoverySource=>({id,label:id,license:'test',kind:'job-feed',discover:async(_ctx,cursor,limit)=>({candidates:candidates.slice(cursor,cursor+limit),nextCursor:Math.min(candidates.length,cursor+limit),total:candidates.length})});
+  const sources:DiscoverySource[]=[feed('linkedin-guest',linkedin),feed('jobspy-indeed',indeed),{id:'job-board-directory',label:'ATS directory',license:'test',kind:'board-directory',discover:async()=>{excludedCalls++;return {candidates:[{sourceId:'job-board-directory',company:'Forbidden fallback',provider:'greenhouse',boardUrl:'https://job-boards.greenhouse.io/forbidden'}],nextCursor:1,total:1};}}];
+  const allocations={linkedin:100,jobspy:100,priority:0,native:0,directories:0},plan=buildDiscoveryPlan(200,sources,allocations);
+  db.store.startDiscoveryRun('strict',undefined,200,plan);await buildQueue('strict',200,sources,db.store,context,1000,undefined,()=>{},false,plan,'balanced');
+  const run:any=db.store.discoveryRun('strict'),rows=run.sources as any[];
+  assert.equal(excludedCalls,0);assert.equal(db.store.discoveryQueue('strict').length,0);assert.equal(run.selection_policy,'strict');assert.equal(run.candidates_returned_count,82);assert.equal(run.skipped_recent_count,82);assert.equal(run.unfilled_count,200);assert.equal(run.shortfall.length,2);
+  assert.equal(rows.find(row=>row.source_id==='job-board-directory').requested_count,0);assert.equal(rows.find(row=>row.source_id==='job-board-directory').queued_count,0);
+  const trace:any=db.store.discoveryTrace('strict',0,200);assert.ok(trace.items.some((event:any)=>event.event_type==='strict-selection-underfilled'));assert.ok(!trace.items.some((event:any)=>event.source_id==='job-board-directory'&&event.event_type==='source-query'));
  }finally{db.close();}
 });
 
@@ -194,6 +250,16 @@ test('Workday prioritizes an explicitly supplied Netherlands facet then resumes 
  const ctx:FetchContext={fetchText:async()=>'',fetchJson:async(_url,init)=>{const body=JSON.parse(String(init?.body));requests.push(body);return {total:1,facets:[{facetParameter:'locationCountry',values:[{id:'nl-country-id',descriptor:'Netherlands'}]}],jobPostings:[{title:'Data Scientist',locationsText:body.appliedFacets.locationCountry?'Vught':'Berlin',externalPath:'/job/scientist',bulletFields:['REQ-1']}]};}};
  const provider=resolveProvider(source),first=await provider.collect(source,ctx);assert.equal(first.complete,false);assert.equal(first.jobs[0].location,'Vught');assert.equal(requests[1].appliedFacets.locationCountry[0],'nl-country-id');assert.match(first.jobs[0].url,/en-US\/External\/job\/scientist/);
  const second=await provider.collect({...source,cursor:first.nextCursor},ctx);assert.equal(second.complete,true);assert.deepEqual(requests.at(-1).appliedFacets,{});
+});
+
+test('Workday uses the posting path instead of shared display metadata as external ID',async()=>{
+ const source={id:'workday',company:'Example',careersUrl:'https://example.wd3.myworkdayjobs.com/External'};
+ const provider=resolveProvider(source),result=await provider.collect(source,{fetchText:async()=>'',fetchJson:async()=>({total:2,jobPostings:[
+  {title:'Data Scientist',locationsText:'Vught',externalPath:'/job/data-scientist/REQ-1',bulletFields:['Application Deadline: 11/11/2026']},
+  {title:'Analytics Engineer',locationsText:'Amsterdam',externalPath:'/job/analytics-engineer/REQ-2',bulletFields:['Application Deadline: 11/11/2026']}
+ ]})});
+ assert.deepEqual(result.jobs.map(job=>job.externalId),['/job/data-scientist/REQ-1','/job/analytics-engineer/REQ-2']);
+ assert.equal(new Set(result.jobs.map(job=>job.externalId)).size,2);
 });
 
 test('Workday details supply descriptions and HTML entities become readable text',async()=>{

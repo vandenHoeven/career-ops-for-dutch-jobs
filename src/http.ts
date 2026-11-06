@@ -5,7 +5,16 @@ import { createHash } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
-export interface HttpOptions { timeoutMs?: number; retries?: number; minDelayMs?: number; cacheDir?: string; cacheTtlMs?: number }
+export interface HttpTraceEvent {
+  type: "request" | "response" | "cache-hit" | "redirect" | "retry" | "error";
+  url: string;
+  attempt?: number;
+  status?: number;
+  durationMs?: number;
+  retryAfterMs?: number;
+  message?: string;
+}
+export interface HttpOptions { timeoutMs?: number; retries?: number; minDelayMs?: number; cacheDir?: string; cacheTtlMs?: number; onEvent?: (event: HttpTraceEvent) => void }
 export class HttpError extends Error { constructor(message: string, public status?: number, public retryable = true, public retryAfterMs?: number) { super(message); this.name = "HttpError"; } }
 
 export function createHttpContext(options: HttpOptions = {}): FetchContext {
@@ -13,6 +22,7 @@ export function createHttpContext(options: HttpOptions = {}): FetchContext {
   const retries = options.retries ?? 2;
   const minDelayMs = options.minDelayMs ?? 100;
   const cacheTtlMs = options.cacheTtlMs ?? 30 * 60_000;
+  const emit=(event:HttpTraceEvent)=>{try{options.onEvent?.(event);}catch{/* Observability cannot change request behavior. */}};
   let lastRequest = 0;
   async function request(urlValue: string, init: RequestInit = {}, redirects = 0): Promise<Response> {
     init.signal?.throwIfAborted();
@@ -28,13 +38,15 @@ export function createHttpContext(options: HttpOptions = {}): FetchContext {
     const bodyPath = options.cacheDir ? join(options.cacheDir, `${cacheKey}.body`) : "";
     let cached: { fetchedAt: number; etag?: string; lastModified?: string; contentType?: string } | null = null;
     if (cacheable) {
-      try { cached = JSON.parse(await readFile(metaPath, "utf8")); if (Date.now() - cached!.fetchedAt < cacheTtlMs) return new Response(await readFile(bodyPath), { status: 200, headers: { "content-type": cached!.contentType ?? "application/json" } }); } catch { cached = null; }
+      try { cached = JSON.parse(await readFile(metaPath, "utf8")); if (Date.now() - cached!.fetchedAt < cacheTtlMs) { emit({type:"cache-hit",url:url.toString(),status:200}); return new Response(await readFile(bodyPath), { status: 200, headers: { "content-type": cached!.contentType ?? "application/json" } }); } } catch { cached = null; }
     }
     for (let attempt = 0; attempt <= retries; attempt++) {
       const wait = Math.max(0, minDelayMs - (Date.now() - lastRequest));
       if (wait) await delay(wait, init.signal);
       lastRequest = Date.now();
+      const attemptStarted=Date.now();
       try {
+        emit({type:"request",url:url.toString(),attempt:attempt+1});
         const conditional = cached ? { ...(cached.etag ? { "if-none-match": cached.etag } : {}), ...(cached.lastModified ? { "if-modified-since": cached.lastModified } : {}) } : {};
         const response = await fetch(url, {
           ...init,
@@ -46,6 +58,7 @@ export function createHttpContext(options: HttpOptions = {}): FetchContext {
           const location = response.headers.get('location');
           if (!location || redirects >= 4) throw new HttpError('Redirect has no destination or exceeds four hops', response.status, false);
           const target = new URL(location, url);
+          emit({type:"redirect",url:target.toString(),attempt:attempt+1,status:response.status,durationMs:Date.now()-attemptStarted});
           // Only the same hostname or its exact www alias is eligible. Every hop
           // is checked again for HTTPS, credentials, ports and private DNS addresses.
           if (target.protocol !== 'https:' || target.username || target.password || target.port) throw new HttpError('Redirect destination is not public HTTPS', response.status, false);
@@ -55,8 +68,9 @@ export function createHttpContext(options: HttpOptions = {}): FetchContext {
           await response.body?.cancel();
           return request(target.toString(), init, redirects + 1);
         }
-        if (response.status === 304 && cached) { cached.fetchedAt = Date.now(); await atomicWrite(metaPath, JSON.stringify(cached)); return new Response(await readFile(bodyPath), { status: 200, headers: { "content-type": cached.contentType ?? "application/json" } }); }
+        if (response.status === 304 && cached) { cached.fetchedAt = Date.now(); await atomicWrite(metaPath, JSON.stringify(cached)); emit({type:"cache-hit",url:url.toString(),attempt:attempt+1,status:304,durationMs:Date.now()-attemptStarted}); return new Response(await readFile(bodyPath), { status: 200, headers: { "content-type": cached.contentType ?? "application/json" } }); }
         if (response.ok) {
+          emit({type:"response",url:url.toString(),attempt:attempt+1,status:response.status,durationMs:Date.now()-attemptStarted});
           if (!cacheable) return response;
           const body = Buffer.from(await response.arrayBuffer());
           await mkdir(options.cacheDir!, { recursive: true });
@@ -71,9 +85,10 @@ export function createHttpContext(options: HttpOptions = {}): FetchContext {
       } catch (error) {
         init.signal?.throwIfAborted();
         lastError = error instanceof HttpError ? error : new HttpError(error instanceof Error ? error.message : String(error), undefined, true);
+        emit({type:"error",url:url.toString(),attempt:attempt+1,status:lastError instanceof HttpError?lastError.status:undefined,durationMs:Date.now()-attemptStarted,retryAfterMs:lastError instanceof HttpError?lastError.retryAfterMs:undefined,message:lastError instanceof Error?lastError.message:String(lastError)});
         if (lastError instanceof HttpError && !lastError.retryable) throw lastError;
       }
-      if (attempt < retries) { const declared = lastError instanceof HttpError ? lastError.retryAfterMs : undefined; await delay(declared ?? (300 * 2 ** attempt + Math.random() * 150), init.signal); }
+      if (attempt < retries) { const declared = lastError instanceof HttpError ? lastError.retryAfterMs : undefined, retryAfterMs=declared ?? (300 * 2 ** attempt + Math.random() * 150); emit({type:"retry",url:url.toString(),attempt:attempt+2,status:lastError instanceof HttpError?lastError.status:undefined,retryAfterMs,message:lastError instanceof Error?lastError.message:String(lastError)}); await delay(retryAfterMs, init.signal); }
     }
     throw lastError instanceof Error ? lastError : new Error(String(lastError));
   }

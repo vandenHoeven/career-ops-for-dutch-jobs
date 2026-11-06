@@ -15,7 +15,13 @@ test("dashboard API validates review and application writes", async () => {
     const review = await fetch(`${base}/api/v1/jobs/${job.id}/review`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ state: "reviewed" }) }); assert.equal(review.status, 200);
     const bad = await fetch(`${base}/api/v1/jobs/${job.id}/application`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ stage: "invented" }) }); assert.equal(bad.status, 400);
     const saved = await fetch(`${base}/api/v1/jobs/${job.id}/application`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ stage: "saved", notes: "Review later" }) }); assert.equal(saved.status, 200);
-    const applications: any = await (await fetch(`${base}/api/v1/applications`)).json(); assert.equal(applications.items[0].stage, "saved");
+    const partial = await fetch(`${base}/api/v1/jobs/${job.id}/application`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ stage: "preparing" }) }); assert.equal(partial.status, 200);
+    assert.equal((await partial.json() as any).notes, "Review later", "partial application updates preserve omitted fields");
+    const applications: any = await (await fetch(`${base}/api/v1/applications`)).json(); assert.equal(applications.items[0].stage, "preparing");
+    const applied = await fetch(`${base}/api/v1/jobs/${job.id}/application`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ stage: "applied" }) });
+    const appliedRecord: any = await applied.json(); assert.equal(applied.status, 200); assert.ok(appliedRecord.appliedAt, "entering a submitted stage records its date automatically");
+    const withdrawn = await fetch(`${base}/api/v1/jobs/${job.id}/application`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ stage: "withdrawn" }) }); assert.equal(withdrawn.status, 200);
+    const history: any = await (await fetch(`${base}/api/v1/jobs/${job.id}/application/history`)).json(); assert.equal(history.items[0].to_stage, "withdrawn"); assert.ok(history.items[0].occurred_at);
     const list: any = await (await fetch(`${base}/api/v1/jobs?eligibility=all`)).json(); assert.equal(list.total, 1); assert.equal(list.items.length, 1);
     const trace: any = await (await fetch(`${base}/api/v1/jobs/${job.id}/trace`)).json();
     const posted = trace.dates.find((entry: any) => entry.key === "posted");
@@ -27,5 +33,10 @@ test("dashboard API validates review and application writes", async () => {
     const providers: any = await (await fetch(`${base}/api/v1/source-performance?type=provider&window=lifetime`)).json(); assert.equal(providers.type, "provider");
     const overlap = await fetch(`${base}/api/v1/coverage/overlap?window=lifetime`); assert.equal(overlap.status, 200); assert.equal((await overlap.json() as any).window, "lifetime");
     const forecast=await fetch(`${base}/api/v1/discovery/forecast`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({limit:100,allocations:{linkedin:25,jobspy:25,priority:25,native:15,directories:10}})});assert.equal(forecast.status,200);assert.equal((await forecast.json() as any).freshnessDays,7);
+    const invalidMode=await fetch(`${base}/api/v1/discovery`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({limit:10,mode:"mystery"})});assert.equal(invalidMode.status,400);
+    const invalidWorkers=await fetch(`${base}/api/v1/discovery`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({limit:10,workers:9})});assert.equal(invalidWorkers.status,400);
+    const discoveryId="aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa";store.startDiscoveryRun(discoveryId,undefined,10,undefined,"fresh");store.recordDiscoveryEvent(discoveryId,{phase:"planning",type:"run-started",message:"Fresh run started"});
+    const run:any=await (await fetch(`${base}/api/v1/discovery/runs/${discoveryId}`)).json();assert.equal(run.mode,"fresh");assert.equal(run.phase,"planning");assert.ok("eta" in run);
+    const runTrace:any=await (await fetch(`${base}/api/v1/discovery/runs/${discoveryId}/trace?after=0`)).json();assert.equal(runTrace.items[0].event_type,"run-started");
   } finally { await new Promise<void>(resolve => server.close(() => resolve())); store.close(); rmSync(dir, { recursive: true, force: true }); }
 });

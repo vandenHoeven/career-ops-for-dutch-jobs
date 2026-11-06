@@ -395,7 +395,10 @@ async function collectWorkday(source:SourceConfig,ctx:FetchContext):Promise<Coll
       }
       const signature=createHash('sha256').update(JSON.stringify(rows.map((r:any)=>r.externalPath))).digest('hex');
       if(rows.length && signature===previous)return {jobs,complete:false,nextCursor:cursor(),total,error:'Repeated Workday page'};
-      for(const row of rows)jobs.push({externalId:text(row.bulletFields?.[0])||text(row.externalPath),company:source.company,title:text(row.title),location:text(row.locationsText),url:validUrl(typeof row.externalPath==='string'&&/^\/job\//.test(row.externalPath)?page.origin+boardPath+row.externalPath:row.externalPath,page.origin),postedAt:date(row.postedOn),raw:{...row,_diegoDetailApi:endpoint.replace(/\/jobs$/,'')+row.externalPath}});
+      // bulletFields is display metadata and can start with a shared value such
+      // as "Application Deadline: 11/11/2026". externalPath is Workday's
+      // per-posting stable key and therefore the safe identity input.
+      for(const row of rows)jobs.push({externalId:text(row.externalPath),company:source.company,title:text(row.title),location:text(row.locationsText),url:validUrl(typeof row.externalPath==='string'&&/^\/job\//.test(row.externalPath)?page.origin+boardPath+row.externalPath:row.externalPath,page.origin),postedAt:date(row.postedOn),raw:{...row,_diegoDetailApi:endpoint.replace(/\/jobs$/,'')+row.externalPath}});
       offset+=rows.length;previous=signature;
       if(rows.length<20||(total!==undefined&&offset>=total)){if(phase==='nl')return {jobs,complete:false,nextCursor:JSON.stringify({offset:0,previous:'',phase:'all',nlDone:true}),total};return {jobs,complete:true,total};}
     }catch(error){return {jobs,complete:false,nextCursor:cursor(),total,error:error instanceof Error?error.message:String(error),httpStatus:error instanceof HttpError?error.status:undefined,retryable:error instanceof HttpError?error.retryable:true,retryAfterMs:error instanceof HttpError?error.retryAfterMs:undefined};}

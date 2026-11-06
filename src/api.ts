@@ -2,7 +2,7 @@ import { coverageRoutes } from './diagnostics.js';
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { Store, type JobQuery } from "./database.js";
 import { scan } from "./scanner.js";
-import { discover, discoveryPlanForUi, validateDiscoveryAllocations, type DiscoveryAllocations } from "./discovery.js";
+import { discover, discoveryPlanForUi, validateDiscoveryAllocations, validateDiscoveryMode, validateDiscoveryWorkers, type DiscoveryAllocations } from "./discovery.js";
 
 async function input(request:IncomingMessage):Promise<any>{const chunks:Buffer[]=[];for await(const chunk of request)chunks.push(chunk);return chunks.length?JSON.parse(Buffer.concat(chunks).toString('utf8')):{};}
 
@@ -68,6 +68,8 @@ export function createApi(store = new Store()) {
       if (request.method === "POST" && url.pathname === "/api/v1/discovery/forecast") {const body=await input(request),requested=Number(body.limit??100),limit=Number.isFinite(requested)?Math.min(Math.max(requested,1),5000):100,allocations=validateDiscoveryAllocations(limit,body.allocations as Partial<DiscoveryAllocations>|undefined);return json(response,200,store.discoveryForecast(limit,allocations));}
       if (request.method === "GET" && url.pathname === "/api/v1/discovery/active") return json(response,200,store.activeDiscoveryRun());
       if (request.method === "GET" && url.pathname === "/api/v1/discovery/runs") return json(response, 200, { items: store.discoveryRuns() });
+      const discoveryRun=url.pathname.match(/^\/api\/v1\/discovery\/runs\/([a-f0-9-]+)$/);if(request.method==="GET"&&discoveryRun){const value=store.discoveryRun(discoveryRun[1]);return value?json(response,200,value):json(response,404,{error:"Discovery run not found"});}
+      const discoveryTrace=url.pathname.match(/^\/api\/v1\/discovery\/runs\/([a-f0-9-]+)\/trace$/);if(request.method==="GET"&&discoveryTrace){const value=store.discoveryTrace(discoveryTrace[1],Number(url.searchParams.get("after")??0),Number(url.searchParams.get("limit")??200));return value?json(response,200,value):json(response,404,{error:"Discovery run not found"});}
       if (request.method === "GET" && url.pathname === "/api/v1/discovery/failures") return json(response, 200, { items: store.discoveryFailures({ retryable: url.searchParams.has("retryable") ? url.searchParams.get("retryable") === "true" : undefined, source: url.searchParams.get("source") ?? undefined, limit: Number(url.searchParams.get("limit") ?? 100), history: url.searchParams.get("history") === "true", includeMissing: url.searchParams.get("includeMissing") === "true" }) });
       if (request.method === "GET" && url.pathname === "/api/v1/coverage") return json(response, 200, {...(store.coverage() as any),...store.coverageTrace()});
       if(request.method==="GET"&&url.pathname==="/api/v1/source-performance")return json(response,200,store.sourcePerformance(url.searchParams.get("type")==="provider"?"provider":"discovery",url.searchParams.get("window")==="lifetime"?"lifetime":"30d"));
@@ -80,7 +82,7 @@ export function createApi(store = new Store()) {
       }
       if (request.method === "POST" && url.pathname === "/api/v1/discovery") {
         const body=await input(request),requested = Number(body.limit??url.searchParams.get("limit") ?? 100),limit=Number.isFinite(requested)?Math.min(Math.max(requested,1),5000):100,allocations=body.allocations?validateDiscoveryAllocations(limit,body.allocations as Partial<DiscoveryAllocations>):undefined;
-        return json(response, 202, await discover({ limit, allocations, source: url.searchParams.get("source") ?? undefined, resume: body.resume===true||url.searchParams.get("resume") === "true", retryFailures: url.searchParams.get("retryFailures") === "true", store }));
+        return json(response, 202, await discover({ limit, mode:validateDiscoveryMode(body.mode), concurrency:validateDiscoveryWorkers(body.workers), allocations, source: url.searchParams.get("source") ?? undefined, resume: body.resume===true||url.searchParams.get("resume") === "true", retryFailures: url.searchParams.get("retryFailures") === "true", store }));
       }
       return json(response, 404, { error: "Not found" });
     } catch (error:any) { return json(response, error?.statusCode??500, { error: error instanceof Error ? error.message : String(error) }); }
