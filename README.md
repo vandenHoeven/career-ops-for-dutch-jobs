@@ -44,6 +44,7 @@ npm run dev -- discover --limit 250
 npm run dev -- discover --limit 100 --workers 6
 npm run dev -- discover --mode fresh --limit 100
 npm run dev -- discover --mode refresh-known --limit 100
+npm run dev -- discover --mode turbo --limit 100
 npm run dev -- discover --source job-board-directory
 npm run dev -- discover --resume
 npm run dev -- discover --retry-failures --limit 50
@@ -77,12 +78,19 @@ active HTTP work and leaves unprocessed candidates pending. Retryable failures
 use increasing cooldowns (15 minutes, 1 hour, 6 hours, then 24 hours); missing
 boards are rechecked after seven days.
 
-Discovery modes are `balanced` (the default rotation and freshness windows),
-`fresh` (never-processed candidates only), and `refresh-known` (stored employer
-and ATS boards immediately, least-recently checked first). The dashboard shows
-source selection, active workers, enrichment targets, adaptive ETA ranges, and
-an expandable HTTP/processing trace. A candidate budget is a ceiling, not a
-promise that every source can supply that many eligible candidates.
+Dashboard discovery is time-based: choose 5, 10, 20, or 30 minutes. During the
+window, an adaptive scheduler continuously reallocates 2–8 workers toward feeds
+and boards with the best recent-match yield per processing minute, while keeping
+an exploration allowance for sources with limited evidence. It stops launching
+new work at the deadline and drains active work for at most 30 seconds.
+
+The optimization target is a distinct, newly discovered, strong Netherlands
+match with a verified posting date. Jobs posted 0–7, 8–30, and 31–60 days ago
+earn weights of 1.0, 0.4, and 0.1; older or unknown dates earn zero. Repeated
+results, failures, acquisition time, and board-processing time reduce priority.
+The dashboard shows the live clock, worker count, freshness outcomes, weighted
+reward, scheduler decisions, description-enrichment state, and technical trace.
+The older candidate-budget modes remain available to internal/CLI workflows.
 
 The final summary separates new and refreshed matching jobs, foreign-only
 boards, empty boards, missing boards, unsupported sources, pending candidates,
@@ -108,7 +116,9 @@ The API listens only on `127.0.0.1:4310`:
 - `GET /api/v1/discovery/failures`
 - `GET /api/v1/coverage`
 - `POST /api/v1/scans?provider=recruitee&resume=true`
-- `POST /api/v1/discovery?limit=100&source=job-board-directory&resume=true&retryFailures=false`
+- `GET /api/v1/discovery/plan?durationMinutes=10`
+- `POST /api/v1/discovery` with `{ "durationMinutes": 10 }`
+- `POST /api/v1/discovery/manual` with `{ "url": "https://..." }`
 - `GET /api/v1/discovery/runs/:id`
 - `GET /api/v1/discovery/runs/:id/trace?after=0&limit=200`
 - `POST /api/v1/discovery/runs/:id/cancel`
@@ -129,7 +139,7 @@ Employer filters include `name`, `headquarters`, `hiring`, `sizeBand`,
 - Headquarters and employee size remain `unknown` unless a source supplies
   evidence. A verified Netherlands vacancy is enough to keep an employer.
 - Cached feeds use ETag/Last-Modified revalidation and atomic cache writes.
-- The default on-demand budget is 100 candidates: 50% benchmark/known Netherlands boards, 30% Dutch feeds, and 20% global directories. Unused capacity is redistributed. Known Netherlands boards refresh after 24 hours; foreign-only and unresolved employers after seven days. Persistent cursors and deduplicated board URLs prevent wasting budget.
+- Dashboard runs use a fixed processing-time window and adaptive source/board ranking. Persistent cursors, recency recovery, and deduplicated board URLs prevent repeated searches from receiving the same credit as fresh yield.
 - Each candidate records an explainable result, request duration, job counts,
   HTTP status, retryability, and a sanitized failure reason.
 - Live runs distinguish fresh candidates, due rechecks, incomplete
@@ -138,8 +148,11 @@ Employer filters include `name`, `headquarters`, `hiring`, `sizeBand`,
   headers or response bodies.
 - `Ctrl+C` finishes active candidates, saves a heartbeat/checkpoint, and marks
   the run interrupted. `--resume` continues at the exact next candidate.
-- Discovery uses four workers by default, at most two per ATS hostname and one
-  for Workday/Ashby. Each collection chunk has a 45-second timeout; collected pages and continuations survive partial failures.
+- Adaptive dashboard discovery uses 2–8 workers, with provider-wide caps of two
+  for Workday and Ashby in addition to per-host limits. Each collection chunk has a
+  25-second deadline and one HTTP retry; collected pages and continuations
+  survive partial failures. SQLite atomically permits only one active discovery
+  run, so repeated dashboard starts attach to the existing run.
 - Expected outcomes (`no-netherlands-jobs`, `empty-board`, `unsupported`) do
   not increase the error count. Retryable failures can be replayed separately.
 
@@ -168,14 +181,14 @@ default. Install the pinned CLI with `py -m pip install -r requirements-jobspy.t
 `indeed,glassdoor`. Every board additionally needs its own permission flag,
 such as `DIEGO_JOBSPY_INDEED_PERMISSION_CONFIRMED=true`; selected boards without
 that flag are neither registered nor invoked. `DIEGO_JOBSPY_COMMAND` can point
-to the virtual environment's `jobspy` executable. By default, focused searches
-are derived from each role family across the Netherlands, with small top-up
-searches for the profile's preferred cities. Optional bounds are
+to the virtual environment's `jobspy` executable. Focused role/city searches
+are separate adaptive arms: one meaningful batch is collected per pull, arms
+rotate between runs, and recently repeated arms cool down before reuse. The
+default freshness window is 30 days. Optional bounds are
 `DIEGO_JOBSPY_TIMEOUT_MS`, `DIEGO_JOBSPY_MAX_PER_SEARCH` (default 15),
 `DIEGO_JOBSPY_MAX_PER_CITY` (default 10), and
-`DIEGO_JOBSPY_MAX_PER_PLATFORM` (default 100, hard cap 200). Up to 30% of the
-platform budget is reserved for preferred-city top-ups. Set
-`DIEGO_JOBSPY_HOURS_OLD` for a freshness filter. Queries and preferred cities
+`DIEGO_JOBSPY_MAX_PER_PLATFORM` (default 100, hard cap 200). Set
+`DIEGO_JOBSPY_HOURS_OLD` to override the freshness window. Queries and preferred cities
 can be overridden with semicolon-separated `DIEGO_JOBSPY_QUERIES` and
 `DIEGO_JOBSPY_PREFERRED_CITIES`; the broad city query and Netherlands location
 can be overridden with `DIEGO_JOBSPY_QUERY`, `DIEGO_JOBSPY_LOCATION`, and
@@ -183,8 +196,11 @@ can be overridden with `DIEGO_JOBSPY_QUERY`, `DIEGO_JOBSPY_LOCATION`, and
 is intentionally unavailable through this bridge; LinkedIn Guest remains the
 existing independent adapter.
 
-Description-aware recall fetches at most 100 plausible missing descriptions per
-discovery run. Remaining work is persisted and can be resumed with:
+Description-aware recall does not block discovery. Plausible missing
+descriptions enter a persistent queue and are processed in batches of 20, with
+two requests at a time, only while discovery is idle. Starting discovery pauses
+the background batch without consuming a retry. The queue can also be processed
+from the CLI with:
 
 ```powershell
 npm.cmd run dev -- enrich --pending --limit 100
@@ -223,8 +239,9 @@ Additional interfaces:
 - `GET /api/v1/jobs/:id/decisions` for append-only explanations.
 - `POST /api/v1/diagnostics/job` with `{"url":"https://?"}` starts a saved missing-job check; poll `GET /api/v1/diagnostics/job/:id`.
 - `GET /api/v1/coverage/trace` for collection states, backlog, and rejection reasons.
-- `GET /api/v1/enrichment/queue/items` and `POST /api/v1/enrichment/queue/:id/retry` for manual retries.
-- `POST /api/v1/enrichment/queue/process` starts up to 100 pending descriptions. Failed requests use cooldowns and Retry-After, with at most four automatic attempts.
+- `GET /api/v1/enrichment/queue` reports ready, cooling-down, terminal, and active-batch description work; `GET /api/v1/enrichment/queue/items` exposes recent queue records.
+- `POST /api/v1/enrichment/queue/process` safely starts currently due work through the shared idle runner. `POST /api/v1/enrichment/queue/:id/retry` explicitly resets one record for manual retry.
+- Transient failures use cooldowns and Retry-After with at most four automatic attempts. Permanent HTTP failures and pages without a usable description become terminal immediately.
 
 Use `config/employers.json` for verified benchmark career URLs. Each entry requires an employer benchmark ID, careersUrl, evidenceUrl, and verifiedAt; a provider is optional. Exact identity or official-site evidence is required; fuzzy company-name matches are not used. The Sources page distinguishes unattempted, resolved, completely collected, partially collected, temporarily failed, and unsupported employers. These states do not assert total market coverage.
 

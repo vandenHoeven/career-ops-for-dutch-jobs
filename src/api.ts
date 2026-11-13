@@ -2,7 +2,8 @@ import { coverageRoutes } from './diagnostics.js';
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { Store, type JobQuery } from "./database.js";
 import { scan } from "./scanner.js";
-import { discover, discoveryPlanForUi, validateDiscoveryAllocations, validateDiscoveryMode, validateDiscoveryWorkers, type DiscoveryAllocations } from "./discovery.js";
+import { discover, discoveryForecastForUi, discoveryPlanForUi, validateDiscoveryAllocations, validateDiscoveryMode, validateDiscoveryWorkers, type DiscoveryAllocations } from "./discovery.js";
+import { loadProfile } from "./config.js";
 
 async function input(request:IncomingMessage):Promise<any>{const chunks:Buffer[]=[];for await(const chunk of request)chunks.push(chunk);return chunks.length?JSON.parse(Buffer.concat(chunks).toString('utf8')):{};}
 
@@ -30,7 +31,7 @@ const landingPage = `<!doctype html>
 </ul><p>Start a scan from the terminal with <code>npm.cmd run dev -- scan</code>.</p></body></html>`;
 
 export function createApi(store = new Store()) {
-  return createServer(async (request: IncomingMessage, response: ServerResponse) => {
+  const server=createServer(async (request: IncomingMessage, response: ServerResponse) => {
     try {
       const url = new URL(request.url ?? "/", "http://localhost");
       if(await coverageRoutes(request,response,url,store))return;
@@ -45,7 +46,7 @@ export function createApi(store = new Store()) {
         const query: JobQuery = {
           matchState:(url.searchParams.get("matchState")??undefined) as any,eligibility:(url.searchParams.get("eligibility")??undefined) as any,
           company: url.searchParams.get("company") ?? undefined, roleFamily: url.searchParams.get("roleFamily") ?? undefined,
-          location: url.searchParams.get("location") ?? undefined, provider: url.searchParams.get("provider") ?? undefined,
+          location: url.searchParams.get("location") ?? undefined, locationAccess:(url.searchParams.get("locationAccess")??undefined) as JobQuery["locationAccess"], provider: url.searchParams.get("provider") ?? undefined,
           status: (url.searchParams.get("status") as JobQuery["status"]) ?? undefined, q: url.searchParams.get("q") ?? undefined,
           from: url.searchParams.get("from") ?? undefined, to: url.searchParams.get("to") ?? undefined,
           remote: url.searchParams.get("remote") ?? undefined, limit: number("limit"), offset: number("offset"),
@@ -64,8 +65,8 @@ export function createApi(store = new Store()) {
       const employerMatch = url.pathname.match(/^\/api\/v1\/employers\/([a-f0-9]{24})$/);
       if (request.method === "GET" && employerMatch) { const employer = store.employer(employerMatch[1]); return employer ? json(response, 200, employer) : json(response, 404, { error: "Employer not found" }); }
       if (request.method === "GET" && url.pathname === "/api/v1/discovery/sources") return json(response, 200, { items: store.discoverySourceRows() });
-      if (request.method === "GET" && url.pathname === "/api/v1/discovery/plan") {const limit=Math.min(Math.max(Number(url.searchParams.get('limit')??100),1),5000);return json(response,200,await discoveryPlanForUi(store,limit));}
-      if (request.method === "POST" && url.pathname === "/api/v1/discovery/forecast") {const body=await input(request),requested=Number(body.limit??100),limit=Number.isFinite(requested)?Math.min(Math.max(requested,1),5000):100,allocations=validateDiscoveryAllocations(limit,body.allocations as Partial<DiscoveryAllocations>|undefined);return json(response,200,store.discoveryForecast(limit,allocations));}
+      if (request.method === "GET" && url.pathname === "/api/v1/discovery/plan") {const limit=Math.min(Math.max(Number(url.searchParams.get('limit')??100),1),5000),mode=validateDiscoveryMode(url.searchParams.get("mode"));return json(response,200,await discoveryPlanForUi(store,limit,mode));}
+      if (request.method === "POST" && url.pathname === "/api/v1/discovery/forecast") {const body=await input(request),requested=Number(body.limit??100),limit=Number.isFinite(requested)?Math.min(Math.max(requested,1),5000):100,mode=validateDiscoveryMode(body.mode),allocations=mode==="turbo"?undefined:validateDiscoveryAllocations(limit,body.allocations as Partial<DiscoveryAllocations>|undefined);return json(response,200,await discoveryForecastForUi(store,limit,allocations,mode,body.allocationWeights));}
       if (request.method === "GET" && url.pathname === "/api/v1/discovery/active") return json(response,200,store.activeDiscoveryRun());
       if (request.method === "GET" && url.pathname === "/api/v1/discovery/runs") return json(response, 200, { items: store.discoveryRuns() });
       const discoveryRun=url.pathname.match(/^\/api\/v1\/discovery\/runs\/([a-f0-9-]+)$/);if(request.method==="GET"&&discoveryRun){const value=store.discoveryRun(discoveryRun[1]);return value?json(response,200,value):json(response,404,{error:"Discovery run not found"});}
@@ -81,12 +82,16 @@ export function createApi(store = new Store()) {
         return json(response, 202, result);
       }
       if (request.method === "POST" && url.pathname === "/api/v1/discovery") {
-        const body=await input(request),requested = Number(body.limit??url.searchParams.get("limit") ?? 100),limit=Number.isFinite(requested)?Math.min(Math.max(requested,1),5000):100,allocations=body.allocations?validateDiscoveryAllocations(limit,body.allocations as Partial<DiscoveryAllocations>):undefined;
-        return json(response, 202, await discover({ limit, mode:validateDiscoveryMode(body.mode), concurrency:validateDiscoveryWorkers(body.workers), allocations, source: url.searchParams.get("source") ?? undefined, resume: body.resume===true||url.searchParams.get("resume") === "true", retryFailures: url.searchParams.get("retryFailures") === "true", store }));
+        const body=await input(request),requested = Number(body.limit??url.searchParams.get("limit") ?? 100),limit=Number.isFinite(requested)?Math.min(Math.max(requested,1),5000):100,mode=validateDiscoveryMode(body.mode),allocations=mode==="turbo"?undefined:body.allocations?validateDiscoveryAllocations(limit,body.allocations as Partial<DiscoveryAllocations>):undefined;
+        return json(response, 202, await discover({ limit, mode, concurrency:mode==="turbo"?8:validateDiscoveryWorkers(body.workers), allocations, source: url.searchParams.get("source") ?? undefined, resume: body.resume===true||url.searchParams.get("resume") === "true", retryFailures: url.searchParams.get("retryFailures") === "true", store }));
       }
       return json(response, 404, { error: "Not found" });
-    } catch (error:any) { return json(response, error?.statusCode??500, { error: error instanceof Error ? error.message : String(error) }); }
+    } catch (error:any) { return json(response, error?.statusCode??500, { error: error instanceof Error ? error.message : String(error),...(error?.activeRun?{activeRun:error.activeRun}:{}) }); }
   });
+  let open=true;
+  void loadProfile().then(async profile=>{await new Promise<void>(resolve=>setTimeout(resolve,250));while(open){const updated=store.backfillLocationAccess(profile,100);if(updated<100)break;await new Promise<void>(resolve=>setTimeout(resolve,25));}}).catch(error=>open&&console.error('Location accessibility backfill failed:',error));
+  server.on('close',()=>{open=false});
+  return server;
 }
 
 export function startApi(port = 4310): void {

@@ -8,6 +8,7 @@ import { loadProfile } from './config.js';
 import { canonicalizeUrl } from './core.js';
 import { enrichPendingJobs } from './quality.js';
 const activeEnrichment=new WeakSet<Store>();
+export interface CoverageRouteOptions { processEnrichment?:()=>{statusCode:number;body:unknown} }
 
 export function publicUrl(value:unknown):string {
   if(typeof value!=='string')throw new Error('A public vacancy URL is required');
@@ -31,7 +32,7 @@ export function startDiagnostic(store:Store,url:string):string{
   void inspectVacancy(store,url).then(result=>store.db.prepare("UPDATE job_diagnostics SET status='completed',result_json=? WHERE id=?").run(JSON.stringify(result),id)).catch(error=>{try{store.db.prepare("UPDATE job_diagnostics SET status='failed',error=?,result_json=? WHERE id=?").run(error instanceof Error?error.message:String(error),JSON.stringify({stage:'unresolved',reason:'Public vacancy could not be retrieved'}),id);}catch{/* Application shutting down. */}});
   return id;
 }
-export async function coverageRoutes(req:IncomingMessage,res:ServerResponse,url:URL,store:Store):Promise<boolean>{
+export async function coverageRoutes(req:IncomingMessage,res:ServerResponse,url:URL,store:Store,options:CoverageRouteOptions={}):Promise<boolean>{
   const send=(status:number,value:unknown)=>{res.writeHead(status,{'content-type':'application/json','cache-control':'no-store'});res.end(JSON.stringify(value));};
   const decisions=url.pathname.match(/^\/api\/v1\/jobs\/([a-f0-9]{24})\/decisions$/);
   if(req.method==='GET'&&decisions){if(!store.job(decisions[1]))send(404,{error:'Job not found'});else send(200,{items:store.decisions(decisions[1])});return true;}
@@ -43,8 +44,9 @@ export async function coverageRoutes(req:IncomingMessage,res:ServerResponse,url:
   const retry=url.pathname.match(/^\/api\/v1\/enrichment\/queue\/([a-f0-9]{24})\/retry$/);
   if(req.method==='POST'&&retry){const row=store.db.prepare('SELECT id FROM enrichment_queue WHERE id=?').get(retry[1]);if(!row)send(404,{error:'Enrichment not found'});else{store.retryEnrichment(retry[1]);send(202,{id:retry[1],status:'pending'});}return true;}
   if(req.method==='GET'&&url.pathname==='/api/v1/coverage/trace'){send(200,store.coverageTrace());return true;}
-  if(req.method==='GET'&&url.pathname==='/api/v1/enrichment/queue/items'){send(200,{items:store.db.prepare("SELECT id,json_extract(job_json,'$.title') title,status,attempts,last_error,next_retry_at FROM enrichment_queue WHERE status IN ('pending','failed') ORDER BY updated_at DESC LIMIT 50").all()});return true;}
+  if(req.method==='GET'&&url.pathname==='/api/v1/enrichment/queue/items'){send(200,{items:store.db.prepare("SELECT id,json_extract(job_json,'$.title') title,status,attempts,last_error,next_retry_at FROM enrichment_queue WHERE status IN ('pending','failed','terminal') ORDER BY updated_at DESC LIMIT 50").all()});return true;}
   if(req.method==='POST'&&url.pathname==='/api/v1/enrichment/queue/process'){
+    if(options.processEnrichment){const result=options.processEnrichment();send(result.statusCode,result.body);return true;}
     const active=store.db.prepare("SELECT id FROM scan_runs WHERE requested_provider='enrichment' AND status='running' LIMIT 1").get();
     if(active||activeEnrichment.has(store)){send(409,{error:'Description collection is already running'});return true;}
     activeEnrichment.add(store);void enrichPendingJobs({store}).catch(()=>{}).finally(()=>activeEnrichment.delete(store));send(202,{status:'running'});return true;

@@ -1,8 +1,9 @@
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { loadProfile } from './config.js';
 import { deduplicate } from './core.js';
 import { plainText } from './posting-parser.js';
-import type { DiscoveryCandidate, DiscoverySource, ProfileConfig, RawJob, WorkArrangement } from './types.js';
+import type { DiscoveryBatch, DiscoveryCandidate, DiscoverySource, DiscoverySourceArm, FetchContext, ProfileConfig, RawJob, WorkArrangement } from './types.js';
 
 export const JOBSPY_VERSION = '1.4.1';
 export const JOBSPY_SITES = ['indeed', 'glassdoor', 'zip_recruiter', 'bayt', 'bdjobs', 'naukri', 'hellowork'] as const;
@@ -141,46 +142,33 @@ export function jobSpyPreferredCitiesFromProfile(profile: ProfileConfig): string
   return cities.slice(0, 5);
 }
 
-const candidate = (site: JobSpySite, job: RawJob): DiscoveryCandidate => ({ sourceId: `jobspy-${site}`, company: job.company, headquarters: 'unknown', provider: 'browser', jobs: [job] });
+const candidate = (site: JobSpySite, job: RawJob, arm?:DiscoverySourceArm): DiscoveryCandidate => ({ sourceId: `jobspy-${site}`, company: job.company, headquarters: 'unknown', provider: 'browser', jobs: [job],searchArmId:arm?.id,searchArmLabel:arm?.label });
 
 export function createJobSpySource(options: JobSpySourceOptions): DiscoverySource {
   const id = `jobspy-${options.site}`;
   let profile: ProfileConfig | undefined;
+  const arms=async():Promise<DiscoverySourceArm[]>=>{
+    profile ??= await loadProfile();
+    const queries=(options.queries?.length?options.queries:options.query?[options.query]:jobSpyQueriesFromProfile(profile)).map(value=>value.trim()).filter(Boolean),broadQuery=options.query??jobSpyQueryFromProfile(profile),cities=options.preferredCities??jobSpyPreferredCitiesFromProfile(profile);
+    if(!queries.length||!broadQuery)throw new Error('CareerOps profile has no JobSpy search terms');
+    const rows=[...queries.map(query=>({query,location:options.location??'Netherlands',kind:'national-role'})),...cities.map(location=>({query:broadQuery,location,kind:'preferred-city'}))];
+    return rows.map(row=>{const key=createHash('sha256').update(`${options.site}|${row.kind}|${row.query}|${row.location}`).digest('hex').slice(0,16);return {id:`jobspy:${options.site}:${key}`,label:`${options.site} · ${row.location} · ${row.query}`,metadata:row};});
+  };
+  const runArm=async(_context:FetchContext,arm:DiscoverySourceArm,limit:number):Promise<DiscoveryBatch>=>{
+    const query=String(arm.metadata?.query??''),location=String(arm.metadata?.location??options.location??'Netherlands'),kind=String(arm.metadata?.kind??'national-role'),armLimit=kind==='preferred-city'?positiveInteger(options.maxPerCity,10,25):positiveInteger(options.maxPerSearch,15,50),resultsWanted=Math.min(Math.max(limit,1),armLimit);
+    const jobs=deduplicate(await runJobSpy({...options,query,location,resultsWanted,hoursOld:options.hoursOld??720})).jobs;
+    const candidates=jobs.map(job=>candidate(options.site,{...job,raw:{...(job.raw as object),searches:[{query,location,kind}]}},arm));
+    return {candidates,nextCursor:0,total:candidates.length,arm,exhaustedReason:candidates.length?undefined:'no-results'};
+  };
   return {
     id, label: `JobSpy ${options.site}`, license: `MIT bridge; ${options.site} access requires separate authorization`, kind: 'job-feed', experimental: true,
+    listArms:arms,
+    discoverArm:runArm,
     async discover(_context, cursor, limit) {
-      profile ??= await loadProfile();
-      const queries = (options.queries?.length ? options.queries : options.query ? [options.query] : jobSpyQueriesFromProfile(profile)).map(value => value.trim()).filter(Boolean);
-      const broadQuery = options.query ?? jobSpyQueryFromProfile(profile);
-      const cities = options.preferredCities ?? jobSpyPreferredCitiesFromProfile(profile);
-      if (!queries.length || !broadQuery) throw new Error('CareerOps profile has no JobSpy search terms');
-      const platformLimit = Math.min(limit, positiveInteger(options.maxPerPlatform ?? options.resultsWanted, 100, 200));
-      const perSearch = positiveInteger(options.maxPerSearch, 15, 50), requestedCityLimit = positiveInteger(options.maxPerCity, 10, 25);
-      const cityBudget = cities.length ? Math.min(cities.length * requestedCityLimit, Math.floor(platformLimit * .3)) : 0;
-      const cityLimit = cityBudget ? Math.max(1, Math.floor(cityBudget / cities.length)) : 0;
-      const nationalBudget = platformLimit - cityLimit * cities.length;
-      const activeQueries = queries.slice(0, Math.min(queries.length, nationalBudget));
-      const nationalLimit = activeQueries.length ? Math.max(1, Math.min(perSearch, Math.floor(nationalBudget / activeQueries.length) || 1)) : 0;
-      const plan = [
-        ...activeQueries.map(query => ({ query, location: options.location ?? 'Netherlands', limit: nationalLimit, kind: 'national-role' })),
-        ...cities.filter(() => cityLimit > 0).map(location => ({ query: broadQuery, location, limit: cityLimit, kind: 'preferred-city' })),
-      ];
-      const byId = new Map<string, RawJob>();
-      for (const search of plan) {
-        const jobs = await runJobSpy({ ...options, query: search.query, location: search.location, resultsWanted: search.limit });
-        for (const job of jobs) {
-          const evidence = { query: search.query, location: search.location, kind: search.kind };
-          const prior = byId.get(job.externalId ?? job.url);
-          if (prior) {
-            const raw = prior.raw as any;
-            raw.searches = [...(raw.searches ?? []), evidence];
-          } else {
-            byId.set(job.externalId ?? job.url, { ...job, raw: { ...(job.raw as object), searches: [evidence] } });
-          }
-        }
-      }
-      const jobs = deduplicate([...byId.values()]).jobs.slice(0, platformLimit);
-      return { candidates: jobs.map(job => candidate(options.site, job)), nextCursor: cursor, total: jobs.length };
+      const available=await arms(),index=available.length?Math.abs(cursor)%available.length:0,arm=available[index];
+      if(!arm)return {candidates:[],nextCursor:cursor,total:0,exhaustedReason:'no-results'};
+      const batch=await runArm(_context,arm,Math.min(limit,positiveInteger(options.maxPerPlatform??options.resultsWanted,100,200)));
+      return {...batch,nextCursor:cursor+1,total:available.length};
     },
   };
 }

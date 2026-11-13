@@ -33,18 +33,10 @@ test('small subprocess bridge invokes the JSONL CLI contract with bounded output
   assert.equal((jobs[0].raw as any).site, 'indeed');
 });
 
-test('hybrid plan covers focused national queries and preferred-city top-ups with provenance', async () => {
+test('JobSpy exposes rotating role and city search arms and pulls one meaningful batch', async () => {
   const source = createJobSpySource({ site: 'indeed', query: 'data roles', queries: ['data analyst', 'data scientist'], preferredCities: ['den bosch', 'utrecht'], maxPerPlatform: 8, maxPerSearch: 3, maxPerCity: 1, command: process.execPath, prefixArgs: [emitter], timeoutMs: 5_000 });
-  const batch = await source.discover(offline, 0, 8);
-  assert.equal(batch.candidates.length, 4);
-  const searches = batch.candidates.map(value => (value.jobs![0].raw as any).searches[0]);
-  assert.deepEqual(searches.map(value => value.kind).sort(), ['national-role', 'national-role', 'preferred-city', 'preferred-city']);
-  assert.deepEqual(searches.filter(value => value.kind === 'preferred-city').map(value => value.location).sort(), ['den bosch', 'utrecht']);
-
-  const duplicate = createJobSpySource({ site: 'indeed', query: 'data', queries: ['data'], preferredCities: ['den bosch', 'utrecht'], maxPerPlatform: 10, command: process.execPath, prefixArgs: [emitter], timeoutMs: 5_000 });
-  const deduped = await duplicate.discover(offline, 0, 10);
-  assert.equal(deduped.candidates.length, 1);
-  assert.equal(((deduped.candidates[0].jobs![0].raw as any).searches as any[]).length, 3);
+  const arms=await source.listArms!();assert.equal(arms.length,4);assert.deepEqual(arms.map(arm=>arm.metadata?.kind).sort(),['national-role','national-role','preferred-city','preferred-city']);assert.deepEqual(arms.filter(arm=>arm.metadata?.kind==='preferred-city').map(arm=>arm.metadata?.location).sort(),['den bosch','utrecht']);
+  const first=await source.discoverArm!(offline,arms[0],8),second=await source.discover(offline,1,8),record=(first.candidates[0].jobs![0].raw as any).record;assert.equal(first.candidates.length,1);assert.equal(second.candidates.length,1);assert.equal(first.candidates[0].searchArmId,arms[0].id);assert.equal(second.arm?.id,arms[1].id);assert.equal(((first.candidates[0].jobs![0].raw as any).searches as any[]).length,1);assert.equal(record.fixture_hours_old,'720');assert.equal(record.fixture_results_wanted,'3');
 });
 
 test('default hybrid plan derives role-family queries and current preferred cities from the profile', async () => {

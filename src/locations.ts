@@ -1,4 +1,4 @@
-import type { ProfileConfig, RawJob, WorkArrangement } from "./types.js";
+import type { LocationAccessAssessment, LocationAccessCityProfile, LocationAccessTier, ProfileConfig, RawJob, WorkArrangement } from "./types.js";
 import { DUTCH_LOCALITIES } from './dutch-localities.js';
 import { normalize, phrase } from './text.js';
 
@@ -50,6 +50,31 @@ const distance = (a: [number, number], b: [number, number]) => {
 };
 
 export interface LocationScore { awarded: number; evidence: string[]; explanation: string }
+
+const accessRank: Record<LocationAccessTier, number> = { easy: 0, medium: 1, hard: 2, remote: 3, unknown: 4 };
+
+function assessCityAccess(city: LocationAccessCityProfile, profile: ProfileConfig): LocationAccessAssessment {
+  const preferences=profile.locationPreferences!.accessibility!;
+  if(city.distanceKm<=preferences.closeOverrideKm)return {tier:'easy',matchedCity:city.city,distanceKm:city.distanceKm,publicTransportMinutes:city.publicTransportMinutes,mode:city.mode,penaltyMinutes:0,effectiveMinutes:city.publicTransportMinutes,confidence:'configured',explanation:`Local override: ${city.city} is ${city.distanceKm} km from ${profile.locationPreferences!.anchor.city}`};
+  if(city.mode==='car-only')return {tier:'hard',matchedCity:city.city,distanceKm:city.distanceKm,mode:city.mode,confidence:'configured',explanation:`${city.city} is car-oriented and outside the ${preferences.closeOverrideKm} km local area`};
+  if(city.publicTransportMinutes===undefined)return {tier:'unknown',matchedCity:city.city,distanceKm:city.distanceKm,mode:city.mode,confidence:'unknown',explanation:`No public-transport time is configured for ${city.city}`};
+  const penalty=preferences.modePenalties[city.mode]??0,effective=city.publicTransportMinutes+penalty;
+  const tier:LocationAccessTier=effective<=preferences.easyMaxMinutes?'easy':effective<=preferences.mediumMaxMinutes?'medium':'hard';
+  const detail=penalty?`${city.publicTransportMinutes} min plus ${penalty} min ${city.mode} burden`:`${city.publicTransportMinutes} min by direct train`;
+  return {tier,matchedCity:city.city,distanceKm:city.distanceKm,publicTransportMinutes:city.publicTransportMinutes,mode:city.mode,penaltyMinutes:penalty,effectiveMinutes:effective,confidence:'configured',explanation:`${city.city}: ${detail} (${effective} effective min)`};
+}
+
+/** Commute filtering is intentionally independent from recommendation scoring. */
+export function classifyLocationAccess(job: Pick<RawJob,'location'|'raw'> & {workArrangement:WorkArrangement}, profile:ProfileConfig):LocationAccessAssessment {
+  const profiles=profile.locationPreferences?.accessibility?.cityProfiles;
+  const matches=(profiles??[]).filter(city=>[city.city,...(city.aliases??[])].some(alias=>contains(job.location,alias))).map(city=>assessCityAccess(city,profile));
+  const eligibility=assessLocation({title:'',company:'',url:'',...job},profile);
+  if(job.workArrangement==='remote'&&eligibility.state==='netherlands')return {tier:'remote',confidence:'configured',explanation:'Explicitly remote and eligible in the Netherlands'};
+  if(eligibility.state==='foreign')return {tier:'unknown',confidence:'unknown',explanation:'Outside the Netherlands'};
+  if(!profiles?.length)return {tier:'unknown',confidence:'unknown',explanation:'No accessibility profile is configured'};
+  if(!matches.length)return {tier:'unknown',confidence:'unknown',explanation:eligibility.state==='unknown'?'Dutch commute location is unconfirmed':'No configured city could be identified from the job location'};
+  return matches.sort((a,b)=>accessRank[a.tier]-accessRank[b.tier]||((a.effectiveMinutes??Infinity)-(b.effectiveMinutes??Infinity)))[0];
+}
 
 export function scoreLocation(job: Pick<RawJob, "location"> & { workArrangement: WorkArrangement }, profile: ProfileConfig): LocationScore {
   const assessment=assessLocation({title:'',company:'',url:'',raw:{},...job},profile);

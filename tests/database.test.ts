@@ -16,8 +16,9 @@ test("SQLite preserves jobs, observations, filters and lifecycle", () => {
     const outside: JobPosting = { ...job, id: "bbbbbbbbbbbbbbbbbbbbbbbb", sourceId: "beta", externalId: "2", company: "Beta", location: "Rotterdam, Netherlands", url: "https://example.com/jobs/2", canonicalUrl: "https://example.com/jobs/2" };
     store.upsertJob(outside, "fingerprint-outside", "scan-1");
     assert.equal(store.jobs({ company: "acm", roleFamily: "data-science" }).length, 1);
-    assert.equal(store.jobs({ locationGroup: "amsterdam" }).length, 1);
-    assert.equal(store.jobs({ locationGroup: "outside-amsterdam" }).length, 1);
+    store.db.prepare("UPDATE jobs SET location_access_tier=CASE WHEN company='Acme' THEN 'medium' ELSE 'hard' END").run();
+    assert.equal(store.jobs({ locationAccess: "medium" }).length, 1);
+    assert.equal(store.jobs({ locationAccess: "hard" }).length, 1);
     store.ageUnseen("acme", "2026-01-02T00:00:00.000Z", 1);
     assert.equal((store.job(job.id) as any).status, "expired");
     assert.equal((store.stats() as any).expired, 1);

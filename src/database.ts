@@ -3,12 +3,15 @@ import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { databasePath } from "./config.js";
 import { BENCHMARK_EMPLOYERS, BENCHMARK_VERSION } from "./benchmark.js";
-import type { ApplicationRecord, ApplicationStage, DiscoveryAttempt, DiscoveryCandidate, Employer, JobPosting, JobStatus, ProviderId, ReviewState, ScoreLedger, SourceConfig } from "./types.js";
+import { buildTransparentForecast, buildTransparentForecastSeries, type ForecastMode, type ForecastPlanRow, type ForecastSeriesInput, type TransparentForecast } from "./forecast.js";
+import { classifyLocationAccess } from "./locations.js";
+import { discoveryArmId, rankAdaptiveArms, recencyReward, type AdaptiveEvidence } from "./adaptive-discovery.js";
+import type { ApplicationRecord, ApplicationStage, DiscoveryAttempt, DiscoveryCandidate, DiscoverySourceArm, Employer, JobPosting, JobStatus, LocationAccessAssessment, LocationAccessTier, ProviderId, ReviewState, ScoreLedger, SourceConfig } from "./types.js";
 
 export interface JobQuery {
   matchState?: 'strong' | 'possible' | 'excluded' | 'all';
   company?: string; roleFamily?: string; location?: string; provider?: string;
-  locationGroup?: "amsterdam" | "outside-amsterdam";
+  locationAccess?: LocationAccessTier;
   status?: JobStatus; q?: string; from?: string; to?: string; remote?: string;
   limit?: number; offset?: number;
   minScore?: number; reviewState?: ReviewState; reviewStates?: ReviewState[]; applicationStage?: ApplicationStage; applicationStages?: ApplicationStage[]; seniority?: string; sort?: string;
@@ -16,29 +19,6 @@ export interface JobQuery {
 }
 export interface EmployerQuery { name?: string; headquarters?: string; hiring?: boolean; matches?: boolean; benchmark?: boolean; sizeBand?: string; provider?: string; source?: string; boardStatus?: string; since?: string; sort?: string; limit?: number; offset?: number }
 const round1=(value:number)=>Math.round(value*10)/10;
-
-export interface DiscoveryForecastCategory {
-  category: string;
-  allocated: number;
-  expectedRecentMatches: number;
-  expectedUndatedMatches: number;
-  recentPer100: number;
-  undatedPer100: number;
-  historicalRuns: number;
-  historicalCandidates: number;
-  modelled: boolean;
-}
-export interface DiscoveryForecast {
-  freshnessDays: 7;
-  limit: number;
-  expectedRecentMatches: number;
-  expectedUndatedMatches: number;
-  confidence: "low" | "medium" | "high";
-  historicalRuns: number;
-  historicalCandidates: number;
-  unmodelledCandidates: number;
-  categories: DiscoveryForecastCategory[];
-}
 
 export class Store {
   readonly db: DatabaseSync;
@@ -251,6 +231,18 @@ export class Store {
     this.ensureColumn("discovery_runs", "duplicate_candidate_count", "INTEGER NOT NULL DEFAULT 0");
     this.ensureColumn("discovery_runs", "unfilled_count", "INTEGER NOT NULL DEFAULT 0");
     this.ensureColumn("discovery_runs", "shortfall_json", "TEXT");
+    this.ensureColumn("discovery_runs", "time_budget_ms", "INTEGER");
+    this.ensureColumn("discovery_runs", "deadline_at", "TEXT");
+    this.ensureColumn("discovery_runs", "drain_deadline_at", "TEXT");
+    this.ensureColumn("discovery_runs", "current_concurrency", "INTEGER NOT NULL DEFAULT 0");
+    this.ensureColumn("discovery_runs", "weighted_reward", "REAL NOT NULL DEFAULT 0");
+    this.ensureColumn("discovery_runs", "useful_match_count", "INTEGER NOT NULL DEFAULT 0");
+    this.ensureColumn("discovery_runs", "recent_7_count", "INTEGER NOT NULL DEFAULT 0");
+    this.ensureColumn("discovery_runs", "recent_30_count", "INTEGER NOT NULL DEFAULT 0");
+    this.ensureColumn("discovery_runs", "recent_60_count", "INTEGER NOT NULL DEFAULT 0");
+    this.ensureColumn("discovery_runs", "unknown_date_count", "INTEGER NOT NULL DEFAULT 0");
+    this.ensureColumn("discovery_runs", "new_strong_count", "INTEGER NOT NULL DEFAULT 0");
+    this.ensureColumn("discovery_runs", "metrics_version", "INTEGER NOT NULL DEFAULT 1");
     this.ensureColumn("discovery_run_sources", "fresh_count", "INTEGER NOT NULL DEFAULT 0");
     this.ensureColumn("discovery_run_sources", "recheck_count", "INTEGER NOT NULL DEFAULT 0");
     this.ensureColumn("discovery_run_sources", "continuation_count", "INTEGER NOT NULL DEFAULT 0");
@@ -277,6 +269,9 @@ export class Store {
     this.ensureColumn("jobs", "hard_excluded", "INTEGER NOT NULL DEFAULT 0");
     this.ensureColumn("jobs", "exclusion_reason", "TEXT");
     this.ensureColumn("jobs", "score_calculated_at", "TEXT");
+    this.ensureColumn("jobs", "location_access_tier", "TEXT");
+    this.ensureColumn("jobs", "location_access_json", "TEXT");
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_jobs_location_access_tier ON jobs(location_access_tier)");
     this.ensureColumn("jobs", "posted_at_source", "TEXT");
     this.ensureColumn("jobs", "posted_date_precision", "TEXT NOT NULL DEFAULT 'unknown'");
     this.ensureColumn("jobs", "valid_through", "TEXT");
@@ -292,7 +287,11 @@ export class Store {
     this.ensureColumn("discovery_attempts", "historical_note", "TEXT");
     this.ensureColumn("discovery_attempts", "collection_partial", "INTEGER NOT NULL DEFAULT 0");
     this.ensureColumn("discovery_attempts", "continuation", "TEXT");
+    this.ensureColumn("discovery_attempts", "collection_duration_ms", "INTEGER");
+    this.ensureColumn("job_enrichment_events", "duration_ms", "INTEGER");
     this.migrateCoverage();
+    this.ensureColumn("discovery_outcomes","is_new","INTEGER NOT NULL DEFAULT 0");
+    this.ensureColumn("discovery_outcomes","match_state","TEXT NOT NULL DEFAULT 'possible'");
     this.seedBenchmark();
     this.db.exec(`UPDATE jobs SET provider_first_observed_at=posted_at,posted_at=NULL,
       summary=COALESCE(summary,json_extract(raw_json,'$.gist'))
@@ -319,10 +318,26 @@ export class Store {
       CREATE INDEX IF NOT EXISTS decision_url ON job_decisions(canonical_url,id);
       CREATE TABLE IF NOT EXISTS collection_checkpoints(board_url TEXT PRIMARY KEY,source_id TEXT NOT NULL,provider TEXT NOT NULL,cursor TEXT,snapshot_started_at TEXT NOT NULL,state TEXT NOT NULL,last_checked_at TEXT NOT NULL,total INTEGER,jobs_collected INTEGER NOT NULL DEFAULT 0,error TEXT,benchmark_id TEXT,candidate_json TEXT);
       CREATE TABLE IF NOT EXISTS job_diagnostics(id TEXT PRIMARY KEY,url TEXT NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL,result_json TEXT,error TEXT);
+      CREATE TABLE IF NOT EXISTS discovery_forecasts(run_id TEXT PRIMARY KEY REFERENCES discovery_runs(id),created_at TEXT NOT NULL,model_version TEXT NOT NULL,target TEXT NOT NULL,input_json TEXT NOT NULL,prediction_json TEXT NOT NULL,actual_new_strong INTEGER,reconciled_at TEXT);
       INSERT OR IGNORE INTO schema_migrations VALUES(1,strftime('%Y-%m-%dT%H:%M:%fZ','now'));
       UPDATE jobs SET match_state='excluded' WHERE hard_excluded=1;
       PRAGMA user_version=1;`);
+    this.db.exec(`UPDATE enrichment_queue SET status='terminal',next_retry_at=NULL
+      WHERE status='failed' AND (
+        attempts>=4 OR last_error='Public posting did not contain a usable job-specific description' OR
+        (last_error GLOB 'HTTP 4[0-9][0-9] *' AND last_error NOT LIKE 'HTTP 408 %' AND last_error NOT LIKE 'HTTP 425 %' AND last_error NOT LIKE 'HTTP 429 %') OR
+        last_error='Cross-domain redirect requires an explicitly configured public board URL'
+      )`);
     this.ensureColumn('collection_checkpoints','last_signature','TEXT');
+    this.db.exec(`CREATE TABLE IF NOT EXISTS discovery_source_pulls(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,run_id TEXT NOT NULL REFERENCES discovery_runs(id),arm_id TEXT NOT NULL,source_id TEXT NOT NULL,label TEXT NOT NULL,
+      started_at TEXT NOT NULL,duration_ms INTEGER NOT NULL,cursor TEXT,requested INTEGER NOT NULL,returned INTEGER NOT NULL,eligible INTEGER NOT NULL,
+      duplicates INTEGER NOT NULL DEFAULT 0,failures INTEGER NOT NULL DEFAULT 0,metadata_json TEXT);
+      CREATE INDEX IF NOT EXISTS discovery_source_pulls_arm ON discovery_source_pulls(arm_id,started_at);
+      CREATE TABLE IF NOT EXISTS discovery_outcomes(
+      run_id TEXT NOT NULL REFERENCES discovery_runs(id),job_id TEXT NOT NULL,arm_id TEXT NOT NULL,source_id TEXT NOT NULL,occurred_at TEXT NOT NULL,
+      new_strong INTEGER NOT NULL,posted_at TEXT,date_band TEXT NOT NULL,reward REAL NOT NULL,PRIMARY KEY(run_id,job_id));
+      CREATE INDEX IF NOT EXISTS discovery_outcomes_arm ON discovery_outcomes(arm_id,occurred_at);`);
   }
   recordDecision(value: {jobId?:string;url:string;sourceId:string;runId?:string;profileFingerprint:string;decision:any;job:any}):void {
     this.db.prepare('INSERT INTO job_decisions(job_id,canonical_url,source_id,run_id,observed_at,rule_version,profile_fingerprint,match_state,retained,reasons_json,evidence_json,job_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)').run(value.jobId??null,value.url,value.sourceId,value.runId??null,new Date().toISOString(),'4',value.profileFingerprint,value.decision.matchState,value.decision.retain?1:0,JSON.stringify(value.decision.reasons),JSON.stringify({location:value.decision.location,match:value.decision.evidence,fieldsInspected:value.decision.fieldsInspected}),JSON.stringify(value.job));
@@ -360,13 +375,30 @@ export class Store {
     const now = new Date().toISOString();
     this.db.prepare(`UPDATE discovery_sources SET cursor=?,total_items=COALESCE(?,total_items),last_run_at=?,last_success_at=CASE WHEN ? IS NULL THEN ? ELSE last_success_at END,last_error=?,processed_total=processed_total+? WHERE id=?`).run(cursor, total ?? null, now, error ?? null, now, error ?? null, processed, id);
   }
-  startDiscoveryRun(id: string, sourceId: string | undefined, limit: number, plan?:unknown, mode="balanced", workerCount=6): void { const now = new Date().toISOString(); this.db.prepare("INSERT INTO discovery_runs(id,source_id,started_at,status,limit_count,heartbeat_at,process_id,plan_json,mode,worker_count,phase,phase_message,selection_policy) VALUES(?,?,?,?,?,?,?,?,?,?,'planning','Preparing discovery sources',?)").run(id, sourceId ?? null, now, "running", limit, now, process.pid,plan?JSON.stringify(plan):null,mode,workerCount,plan?'strict':'explicit-source'); }
-  saveDiscoveryPlan(id:string,plan:any):void { this.db.prepare('UPDATE discovery_runs SET plan_json=? WHERE id=?').run(JSON.stringify(plan),id);const insert=this.db.prepare(`INSERT INTO discovery_run_sources(run_id,source_id,label,category,planned_count) VALUES(?,?,?,?,?) ON CONFLICT(run_id,source_id) DO UPDATE SET label=excluded.label,category=excluded.category,planned_count=excluded.planned_count`);for(const row of plan.sources)insert.run(id,row.id,row.label,row.category,row.planned); }
+  claimDiscoveryRun(id: string, sourceId: string | undefined, limit: number, plan?:any, mode="balanced", workerCount=6, resume=false): {claimed:true}|{claimed:false;activeRun:any} {
+    const now=new Date().toISOString();this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const target=resume?this.db.prepare("SELECT id,started_at,status,mode,limit_count,processed_count,queued_count FROM discovery_runs WHERE id=?").get(id) as any:undefined;
+      if(target?.status==='running'){this.db.exec("ROLLBACK");return {claimed:false,activeRun:target};}
+      const active=this.db.prepare("SELECT id,started_at,status,mode,limit_count,processed_count,queued_count FROM discovery_runs WHERE status='running' AND id<>? ORDER BY started_at LIMIT 1").get(id) as any;
+      if(active){this.db.exec("ROLLBACK");return {claimed:false,activeRun:active};}
+      if(resume)this.db.prepare("UPDATE discovery_runs SET status='running',finished_at=NULL,heartbeat_at=?,process_id=?,phase='processing',phase_message='Resuming persisted candidate queue' WHERE id=?").run(now,process.pid,id);
+      else this.db.prepare("INSERT INTO discovery_runs(id,source_id,started_at,status,limit_count,heartbeat_at,process_id,plan_json,mode,worker_count,phase,phase_message,selection_policy) VALUES(?,?,?,?,?,?,?,?,?,?,'planning','Preparing discovery sources',?)").run(id,sourceId??null,now,"running",limit,now,process.pid,plan?JSON.stringify(plan):null,mode,workerCount,plan?.rules?.selectionPolicy??(plan?'strict':'explicit-source'));
+      this.db.exec("COMMIT");return {claimed:true};
+    } catch(error){this.db.exec("ROLLBACK");throw error;}
+  }
+  claimTimedDiscoveryRun(id:string,durationMs:number):{claimed:true}|{claimed:false;activeRun:any}{
+    const result=this.claimDiscoveryRun(id,undefined,0,undefined,"adaptive",4,false);if(!result.claimed)return result;
+    const now=Date.now(),deadline=new Date(now+durationMs).toISOString(),drain=new Date(now+durationMs+30_000).toISOString();
+    this.db.prepare("UPDATE discovery_runs SET time_budget_ms=?,deadline_at=?,drain_deadline_at=?,current_concurrency=4,selection_policy='adaptive-time',metrics_version=2 WHERE id=?").run(durationMs,deadline,drain,id);return result;
+  }
+  startDiscoveryRun(id: string, sourceId: string | undefined, limit: number, plan?:any, mode="balanced", workerCount=6): void { const now=new Date().toISOString();this.db.prepare("INSERT INTO discovery_runs(id,source_id,started_at,status,limit_count,heartbeat_at,process_id,plan_json,mode,worker_count,phase,phase_message,selection_policy) VALUES(?,?,?,?,?,?,?,?,?,?,'planning','Preparing discovery sources',?)").run(id,sourceId??null,now,"running",limit,now,process.pid,plan?JSON.stringify(plan):null,mode,workerCount,plan?.rules?.selectionPolicy??(plan?'strict':'explicit-source')); }
+  saveDiscoveryPlan(id:string,plan:any):void { this.db.prepare('UPDATE discovery_runs SET plan_json=?,selection_policy=? WHERE id=?').run(JSON.stringify(plan),plan?.rules?.selectionPolicy??'strict',id);const insert=this.db.prepare(`INSERT INTO discovery_run_sources(run_id,source_id,label,category,planned_count) VALUES(?,?,?,?,?) ON CONFLICT(run_id,source_id) DO UPDATE SET label=excluded.label,category=excluded.category,planned_count=excluded.planned_count`);for(const row of plan.sources)insert.run(id,row.id,row.label,row.category,row.planned); }
   updateDiscoveryPlanSource(runId:string,sourceId:string,value:{queued:number;duplicates:number;reassigned:number;exhausted:boolean;fresh?:number;recheck?:number;continuation?:number;forcedRefresh?:number;skippedRecent?:number;cursor?:string|number;requested?:number;returned?:number}):void {this.db.prepare(`UPDATE discovery_run_sources SET queued_count=?,duplicate_count=?,reassigned_count=?,exhausted=?,fresh_count=COALESCE(?,fresh_count),recheck_count=COALESCE(?,recheck_count),continuation_count=COALESCE(?,continuation_count),forced_refresh_count=COALESCE(?,forced_refresh_count),skipped_recent_count=COALESCE(?,skipped_recent_count),current_cursor=COALESCE(?,current_cursor),requested_count=COALESCE(?,requested_count),returned_count=COALESCE(?,returned_count) WHERE run_id=? AND source_id=?`).run(value.queued,value.duplicates,value.reassigned,value.exhausted?1:0,value.fresh??null,value.recheck??null,value.continuation??null,value.forcedRefresh??null,value.skippedRecent??null,value.cursor===undefined?null:String(value.cursor),value.requested??null,value.returned??null,runId,sourceId);}
   discoveryRunSources(runId:string):unknown[]{return this.db.prepare(`SELECT p.source_id,p.label,p.category,p.planned_count,p.reassigned_count,p.queued_count,p.duplicate_count,p.exhausted,
     p.fresh_count,p.recheck_count,p.continuation_count,p.forced_refresh_count,p.skipped_recent_count,p.current_cursor,p.requested_count,p.returned_count,
     COUNT(a.id) processed_count,COALESCE(SUM(a.jobs_fetched),0) jobs_fetched,COALESCE(SUM(a.netherlands_jobs),0) netherlands_jobs,COALESCE(SUM(a.profile_matches),0) profile_matches,
-    COALESCE(AVG(a.duration_ms),0) avg_duration_ms,(SELECT COUNT(*) FROM discovery_run_tasks t WHERE t.run_id=p.run_id AND t.source_id=p.source_id) active_workers,
+    COALESCE(AVG(COALESCE(a.collection_duration_ms,a.duration_ms)),0) avg_duration_ms,(SELECT COUNT(*) FROM discovery_run_tasks t WHERE t.run_id=p.run_id AND t.source_id=p.source_id) active_workers,
     (SELECT GROUP_CONCAT(DISTINCT t.stage) FROM discovery_run_tasks t WHERE t.run_id=p.run_id AND t.source_id=p.source_id) active_stages,
     COALESCE(SUM(CASE WHEN a.result IN ('timeout','rate-limited','network-error','parse-error','invalid-record') THEN 1 ELSE 0 END),0) errors
     FROM discovery_run_sources p LEFT JOIN discovery_attempts a ON a.run_id=p.run_id AND a.source_id=p.source_id WHERE p.run_id=? GROUP BY p.source_id ORDER BY p.planned_count DESC,p.source_id`).all(runId);}
@@ -378,63 +410,105 @@ export class Store {
     if(count>=2000){this.db.prepare("UPDATE discovery_runs SET dropped_event_count=dropped_event_count+1 WHERE id=?").run(runId);return;}
     this.db.prepare("INSERT INTO discovery_run_events(run_id,occurred_at,level,phase,event_type,source_id,candidate_id,worker_id,message,url,cursor,attempt,http_status,duration_ms,metadata_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run(runId,new Date().toISOString(),event.level??"info",event.phase,event.type,event.sourceId??null,event.candidateId??null,event.workerId??null,event.message,event.url??null,event.cursor===undefined?null:String(event.cursor),event.attempt??null,event.httpStatus??null,event.durationMs??null,event.metadata===undefined?null:JSON.stringify(event.metadata));
   }
+  recordDiscoveryPull(value:{runId:string;armId:string;sourceId:string;label:string;startedAt:string;durationMs:number;cursor:number;requested:number;returned:number;eligible:number;duplicates?:number;failures?:number;metadata?:unknown}):void{
+    this.db.prepare("INSERT INTO discovery_source_pulls(run_id,arm_id,source_id,label,started_at,duration_ms,cursor,requested,returned,eligible,duplicates,failures,metadata_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)").run(value.runId,value.armId,value.sourceId,value.label,value.startedAt,value.durationMs,String(value.cursor),value.requested,value.returned,value.eligible,value.duplicates??0,value.failures??0,value.metadata===undefined?null:JSON.stringify(value.metadata));
+  }
+  recordDiscoveryOutcome(runId:string,jobId:string,candidate:DiscoveryCandidate,postedAt:string|undefined,value:{isNew?:boolean;matchState:string}):void{
+    if(!this.db.prepare("SELECT id FROM discovery_runs WHERE id=?").get(runId))return;
+    const armId=discoveryArmId(candidate),fresh=recencyReward(postedAt),now=new Date().toISOString();
+    const existing=this.db.prepare("SELECT new_strong,is_new FROM discovery_outcomes WHERE run_id=? AND job_id=?").get(runId,jobId) as any,isNew=value.isNew??Boolean(existing?.is_new),newStrong=isNew&&value.matchState==='strong',upgrade=newStrong&&!existing?.new_strong;
+    if(existing)this.db.prepare("UPDATE discovery_outcomes SET arm_id=?,source_id=?,is_new=?,match_state=?,new_strong=?,posted_at=?,date_band=?,reward=?,occurred_at=? WHERE run_id=? AND job_id=?").run(armId,candidate.sourceId,isNew?1:0,value.matchState,newStrong?1:0,postedAt??null,fresh.band,newStrong?fresh.reward:0,now,runId,jobId);
+    else this.db.prepare("INSERT INTO discovery_outcomes(run_id,job_id,arm_id,source_id,occurred_at,new_strong,posted_at,date_band,reward,is_new,match_state) VALUES(?,?,?,?,?,?,?,?,?,?,?)").run(runId,jobId,armId,candidate.sourceId,now,newStrong?1:0,postedAt??null,fresh.band,newStrong?fresh.reward:0,isNew?1:0,value.matchState);
+    if(upgrade)this.db.prepare(`UPDATE discovery_runs SET new_strong_count=new_strong_count+1,weighted_reward=weighted_reward+?,useful_match_count=useful_match_count+CASE WHEN ?>0 THEN 1 ELSE 0 END,
+      recent_7_count=recent_7_count+CASE WHEN ?='0-7' THEN 1 ELSE 0 END,recent_30_count=recent_30_count+CASE WHEN ?='8-30' THEN 1 ELSE 0 END,
+      recent_60_count=recent_60_count+CASE WHEN ?='31-60' THEN 1 ELSE 0 END,unknown_date_count=unknown_date_count+CASE WHEN ?='unknown' THEN 1 ELSE 0 END WHERE id=?`).run(fresh.reward,fresh.reward,fresh.band,fresh.band,fresh.band,fresh.band,runId);
+  }
+  adaptiveArmRanking(sourceRows:Array<{id:string;label:string}>):any[]{
+    const pullHistory=new Map((this.db.prepare(`SELECT p.source_id,SUM(MAX(p.returned,1)) pulls,SUM(p.duration_ms) worker_ms,SUM(p.failures) failures,SUM(p.duplicates) duplicates,MAX(p.started_at) last_at
+      FROM discovery_source_pulls p JOIN discovery_runs r ON r.id=p.run_id WHERE r.metrics_version>=2 AND p.started_at>=datetime('now','-30 days') GROUP BY p.source_id`).all() as any[]).map(row=>[String(row.source_id),row])),rewards=new Map((this.db.prepare(`SELECT o.source_id,SUM(o.reward) reward FROM discovery_outcomes o JOIN discovery_runs r ON r.id=o.run_id WHERE r.metrics_version>=2 AND o.occurred_at>=datetime('now','-30 days') GROUP BY o.source_id`).all() as any[]).map(row=>[String(row.source_id),Number(row.reward??0)]));
+    const evidence:AdaptiveEvidence[]=sourceRows.map(row=>{const pull=pullHistory.get(row.id);return {armId:`source:${row.id}`,sourceId:row.id,label:row.label,pulls:Number(pull?.pulls??0),workerMs:Number(pull?.worker_ms??0),reward:rewards.get(row.id)??0,failures:Number(pull?.failures??0),duplicates:Number(pull?.duplicates??0),lastAt:pull?.last_at};});
+    return rankAdaptiveArms(evidence);
+  }
+  adaptiveSearchArmRanking(sourceId:string,arms:DiscoverySourceArm[]):any[]{
+    const rows=this.db.prepare(`SELECT p.arm_id,SUM(MAX(p.returned,1)) pulls,SUM(p.duration_ms) worker_ms,SUM(p.failures) failures,SUM(p.duplicates) duplicates,MAX(p.started_at) last_at,
+      COALESCE((SELECT SUM(o.reward) FROM discovery_outcomes o JOIN discovery_runs ro ON ro.id=o.run_id WHERE ro.metrics_version>=2 AND o.arm_id=p.arm_id AND o.occurred_at>=datetime('now','-30 days')),0) reward
+      FROM discovery_source_pulls p JOIN discovery_runs r ON r.id=p.run_id WHERE r.metrics_version>=2 AND p.source_id=? AND p.started_at>=datetime('now','-30 days') GROUP BY p.arm_id`).all(sourceId) as any[],byId=new Map(rows.map(row=>[String(row.arm_id),row]));
+    return rankAdaptiveArms(arms.map(arm=>{const row=byId.get(arm.id);return {armId:arm.id,sourceId,label:arm.label,pulls:Number(row?.pulls??0),workerMs:Number(row?.worker_ms??0),reward:Number(row?.reward??0),failures:Number(row?.failures??0),duplicates:Number(row?.duplicates??0),lastAt:row?.last_at};}));
+  }
+  lastDiscoveryArmPull(armId:string):string|undefined{return (this.db.prepare("SELECT MAX(started_at) last_at FROM discovery_source_pulls WHERE arm_id=?").get(armId) as any)?.last_at;}
+  adaptiveCandidateScore(candidate:DiscoveryCandidate):number{
+    if(!candidate.boardUrl)return Number(this.adaptiveArmRanking([{id:candidate.sourceId,label:candidate.sourceId}])[0]?.score??0);
+    const armId=discoveryArmId(candidate),attempt=this.db.prepare(`SELECT COUNT(*) pulls,SUM(COALESCE(collection_duration_ms,duration_ms)) worker_ms,
+      SUM(CASE WHEN result IN ('timeout','rate-limited','network-error','parse-error','invalid-record') THEN 1 ELSE 0 END) failures,MAX(started_at) last_at
+      FROM discovery_attempts WHERE board_url=? AND started_at>=datetime('now','-30 days')`).get(candidate.boardUrl) as any,
+      outcome=this.db.prepare("SELECT SUM(reward) reward FROM discovery_outcomes WHERE arm_id=? AND occurred_at>=datetime('now','-30 days')").get(armId) as any;
+    return Number(rankAdaptiveArms([{armId,sourceId:candidate.sourceId,label:candidate.company,pulls:Number(attempt?.pulls??0),workerMs:Number(attempt?.worker_ms??0),reward:Number(outcome?.reward??0),failures:Number(attempt?.failures??0),duplicates:0,lastAt:attempt?.last_at}])[0]?.score??0);
+  }
+  adaptiveForecast(durationMinutes:number,sourceRows:Array<{id:string;label:string}>):any{
+    const arms=this.adaptiveArmRanking(sourceRows),minutes=durationMinutes,point=arms.slice(0,Math.min(8,arms.length)).reduce((sum,row)=>sum+row.expectedRewardPerMinute,0)*minutes*.55,trainingPulls=arms.reduce((sum,row)=>sum+row.pulls,0),confidence=trainingPulls>=500?'limited':'experimental',radius=Math.max(2,Math.sqrt(point+1)*1.96);
+    return {durationMinutes,target:'new-date-verified-strong-nl',targetDefinition:'Distinct newly discovered strong Netherlands jobs, weighted by verified posting age.',expectedUsefulMatches:{point:Number(point.toFixed(1)),lower:Number(Math.max(0,point-radius).toFixed(1)),upper:Number((point+radius).toFixed(1))},expectedWeightedReward:Number(point.toFixed(1)),confidence,trainingPulls,arms:arms.slice(0,12),warnings:[trainingPulls?'Forecast uses measured metrics-v2 pulls only.':'Metrics v2 starts without legacy timing assumptions; confidence will improve after new timed runs.'],recencyWeights:{'0-7':1,'8-30':.4,'31-60':.1,older:0,unknown:0}};
+  }
   discoveryTrace(runId:string,after=0,limit=200):unknown {const row=this.db.prepare("SELECT dropped_event_count FROM discovery_runs WHERE id=?").get(runId) as any;if(!row)return undefined;const items=(this.db.prepare("SELECT sequence,occurred_at,level,phase,event_type,source_id,candidate_id,worker_id,message,url,cursor,attempt,http_status,duration_ms,metadata_json FROM discovery_run_events WHERE run_id=? AND sequence>? ORDER BY sequence LIMIT ?").all(runId,after,Math.min(Math.max(limit,1),500)) as any[]).map(item=>({...item,metadata:item.metadata_json?JSON.parse(item.metadata_json):null,metadata_json:undefined}));return {items,droppedCount:Number(row.dropped_event_count??0),nextAfter:items.at(-1)?.sequence??after};}
   startDiscoveryTask(runId:string,candidateId:string,workerId:string,candidate:DiscoveryCandidate,stage="resolving-board",detail?:string):void {const now=new Date().toISOString();this.db.prepare(`INSERT INTO discovery_run_tasks(run_id,candidate_id,worker_id,source_id,provider,company,board_url,stage,detail,started_at,stage_started_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(run_id,candidate_id) DO UPDATE SET worker_id=excluded.worker_id,stage=excluded.stage,detail=excluded.detail,stage_started_at=excluded.stage_started_at,updated_at=excluded.updated_at`).run(runId,candidateId,workerId,candidate.sourceId,candidate.provider??null,candidate.company,candidate.boardUrl??null,stage,detail??null,now,now,now);}
   updateDiscoveryTask(runId:string,candidateId:string,stage:string,value:{detail?:string;jobTitle?:string;jobUrl?:string}={}):void {const now=new Date().toISOString();this.db.prepare("UPDATE discovery_run_tasks SET stage=?,detail=?,job_title=?,job_url=?,stage_started_at=?,updated_at=? WHERE run_id=? AND candidate_id=?").run(stage,value.detail??null,value.jobTitle??null,value.jobUrl??null,now,now,runId,candidateId);}
   finishDiscoveryTask(runId:string,candidateId:string):void {this.db.prepare("DELETE FROM discovery_run_tasks WHERE run_id=? AND candidate_id=?").run(runId,candidateId);}
   clearDiscoveryTasks(runId:string):void {this.db.prepare("DELETE FROM discovery_run_tasks WHERE run_id=?").run(runId);}
-  discoveryForecast(limit:number,allocations:Record<string,number>):DiscoveryForecast {
-    const weights=[1,.6,.36,.216,.1296], categories=Object.keys(allocations), rows=this.db.prepare(`
-      WITH recent_runs AS (
-        SELECT id,started_at,finished_at FROM discovery_runs
-        WHERE source_id IS NULL AND status IN ('completed','partial') AND finished_at IS NOT NULL
-          AND processed_count>=25 AND processed_count>=limit_count*.5
-        ORDER BY started_at DESC LIMIT 5
-      )
-      SELECT r.id,r.started_at,r.finished_at,p.category,COUNT(a.id) candidates
-      FROM recent_runs r
-      JOIN discovery_run_sources p ON p.run_id=r.id
-      JOIN discovery_attempts a ON a.run_id=r.id AND a.source_id=p.source_id
-      GROUP BY r.id,p.category
-      ORDER BY r.started_at DESC
-    `).all() as any[];
-    const outcome=this.db.prepare(`
-      SELECT
-        COUNT(DISTINCT CASE WHEN j.posted_at IS NOT NULL
-          AND date(j.posted_at)>=date(?,'-7 days') AND date(j.posted_at)<=date(?,'+1 day') THEN d.job_id END) recent,
-        COUNT(DISTINCT CASE WHEN j.posted_at IS NULL OR trim(j.posted_at)='' THEN d.job_id END) undated
-      FROM job_decisions d JOIN jobs j ON j.id=d.job_id
-      WHERE d.run_id=? AND d.retained=1 AND d.match_state IN ('strong','possible')
-        AND d.source_id IN (SELECT source_id FROM discovery_run_sources WHERE run_id=? AND category=?)
-        AND datetime(j.first_seen_at)>=datetime(?) AND datetime(j.first_seen_at)<=datetime(?)
-    `);
-    const usedRuns=new Set<string>();let historicalCandidates=0,unmodelledCandidates=0;
-    const result:DiscoveryForecastCategory[]=categories.map(category=>{
-      const allocation=Number(allocations[category]??0), history=rows.filter(row=>row.category===category).slice(0,5);
-      if(!history.length){unmodelledCandidates+=allocation;return {category,allocated:allocation,expectedRecentMatches:0,expectedUndatedMatches:0,recentPer100:0,undatedPer100:0,historicalRuns:0,historicalCandidates:0,modelled:false};}
-      let weightedCandidates=0,weightedRecent=0,weightedUndated=0,candidates=0;
-      history.forEach((row,index)=>{const counts=outcome.get(row.started_at,row.finished_at,`discovery-${row.id}`,row.id,category,row.started_at,row.finished_at) as any,weight=weights[index],count=Number(row.candidates);weightedCandidates+=weight*count;weightedRecent+=weight*Number(counts.recent??0);weightedUndated+=weight*Number(counts.undated??0);candidates+=count;if(allocation>0)usedRuns.add(row.id);});
-      if(allocation>0)historicalCandidates+=candidates;const recentRate=weightedCandidates?weightedRecent/weightedCandidates:0,undatedRate=weightedCandidates?weightedUndated/weightedCandidates:0;
-      return {category,allocated:allocation,expectedRecentMatches:round1(allocation*recentRate),expectedUndatedMatches:round1(allocation*undatedRate),recentPer100:round1(recentRate*100),undatedPer100:round1(undatedRate*100),historicalRuns:history.length,historicalCandidates:candidates,modelled:true};
-    });
-    const historicalRuns=usedRuns.size;let confidence:"low"|"medium"|"high"=historicalCandidates>=300&&historicalRuns>=3?"high":historicalCandidates>=100&&historicalRuns>=2?"medium":"low";
-    if(unmodelledCandidates>0)confidence=confidence==='high'?'medium':'low';
-    return {freshnessDays:7,limit,expectedRecentMatches:round1(result.reduce((sum,row)=>sum+row.expectedRecentMatches,0)),expectedUndatedMatches:round1(result.reduce((sum,row)=>sum+row.expectedUndatedMatches,0)),confidence,historicalRuns,historicalCandidates,unmodelledCandidates,categories:result};
+  private forecastHistory():any[]{return this.db.prepare(`
+    WITH attempt_counts AS (
+      SELECT run_id,source_id,COUNT(*) candidates,SUM(CASE WHEN result IN ('timeout','rate-limited','network-error','parse-error','invalid-record') THEN 1 ELSE 0 END) failures
+      FROM discovery_attempts GROUP BY run_id,source_id
+    ), outcomes AS (
+      SELECT r.id run_id,so.source_id,COUNT(DISTINCT j.id) new_strong
+      FROM discovery_runs r JOIN source_observations so ON so.discovery_run_id=r.id JOIN jobs j ON j.id=so.job_id
+      WHERE j.match_state='strong' AND datetime(j.first_seen_at)>=datetime(r.started_at)
+      GROUP BY r.id,so.source_id
+    )
+    SELECT r.id runId,r.started_at startedAt,COALESCE(r.mode,'balanced') mode,p.source_id sourceId,p.label,p.category,p.planned_count planned,
+      COALESCE(a.candidates,0) candidates,COALESCE(a.failures,0) failures,COALESCE(o.new_strong,0) newStrong
+    FROM discovery_runs r JOIN discovery_run_sources p ON p.run_id=r.id
+    LEFT JOIN attempt_counts a ON a.run_id=r.id AND a.source_id=p.source_id LEFT JOIN outcomes o ON o.run_id=r.id AND o.source_id=p.source_id
+    WHERE r.source_id IS NULL AND r.status IN ('completed','partial') AND r.finished_at IS NOT NULL AND r.processed_count>0
+    ORDER BY r.started_at,p.source_id
+  `).all();}
+  discoveryForecast(limit:number,allocations:Record<string,number>,mode:ForecastMode="balanced",plan?:ForecastPlanRow[]):TransparentForecast {
+    const rows=(plan?.length?plan:Object.entries(allocations).map(([category,planned])=>({sourceId:`category:${category}`,label:category,category,planned:Number(planned)}))).filter(row=>row.planned>0);
+    return buildTransparentForecast(this.forecastHistory(),rows,mode,limit);
   }
-  resumeDiscoveryRun(id: string): void { this.db.prepare("UPDATE discovery_runs SET status='running',finished_at=NULL,heartbeat_at=?,process_id=?,phase='processing',phase_message='Resuming persisted candidate queue' WHERE id=?").run(new Date().toISOString(), process.pid, id); }
+  discoveryForecastSeries(inputs:ForecastSeriesInput[],mode:ForecastMode="balanced"):TransparentForecast[] {return buildTransparentForecastSeries(this.forecastHistory(),inputs,mode);}
+  discoveryForecastBudgetSupport():{minLimit:number;maxLimit:number;runs:number}{const row=this.db.prepare("SELECT MIN(limit_count) minLimit,MAX(limit_count) maxLimit,COUNT(*) runs FROM discovery_runs WHERE source_id IS NULL AND status IN ('completed','partial') AND finished_at IS NOT NULL AND processed_count>0").get() as any;return {minLimit:Number(row?.minLimit??1),maxLimit:Number(row?.maxLimit??0),runs:Number(row?.runs??0)};}
+  saveDiscoveryForecast(runId:string,input:unknown,forecast:TransparentForecast):void {this.db.prepare(`INSERT INTO discovery_forecasts(run_id,created_at,model_version,target,input_json,prediction_json) VALUES(?,?,?,?,?,?) ON CONFLICT(run_id) DO UPDATE SET created_at=excluded.created_at,model_version=excluded.model_version,target=excluded.target,input_json=excluded.input_json,prediction_json=excluded.prediction_json`).run(runId,new Date().toISOString(),forecast.modelVersion,forecast.target,JSON.stringify(input),JSON.stringify(forecast));}
+  private actualNewStrongMatches(runId:string):number {const row=this.db.prepare(`SELECT COUNT(DISTINCT j.id) count FROM discovery_runs r JOIN source_observations so ON so.discovery_run_id=r.id JOIN jobs j ON j.id=so.job_id WHERE r.id=? AND j.match_state='strong' AND datetime(j.first_seen_at)>=datetime(r.started_at)`).get(runId) as any;return Number(row?.count??0);}
+  pendingEnrichmentCount(runId?:string):number {const row=this.db.prepare(`SELECT COUNT(*) count FROM enrichment_queue WHERE status IN ('pending','failed') AND attempts<4 AND (? IS NULL OR discovery_run_id=?)`).get(runId??null,runId??null) as any;return Number(row?.count??0);}
+  eligibleEnrichmentCount():number {const row=this.db.prepare("SELECT COUNT(*) count FROM enrichment_queue WHERE status IN ('pending','failed') AND attempts<4 AND (next_retry_at IS NULL OR next_retry_at<=strftime('%Y-%m-%dT%H:%M:%fZ','now'))").get() as any;return Number(row?.count??0);}
+  enrichmentQueueSummary():{eligibleNow:number;coolingDown:number;terminal:number;complete:number;skipped:number;nextRetryAt?:string} {
+    const row=this.db.prepare(`SELECT
+      SUM(CASE WHEN status IN ('pending','failed') AND attempts<4 AND (next_retry_at IS NULL OR next_retry_at<=strftime('%Y-%m-%dT%H:%M:%fZ','now')) THEN 1 ELSE 0 END) eligible_now,
+      SUM(CASE WHEN status IN ('pending','failed') AND attempts<4 AND next_retry_at>strftime('%Y-%m-%dT%H:%M:%fZ','now') THEN 1 ELSE 0 END) cooling_down,
+      SUM(CASE WHEN status='terminal' OR (status='failed' AND attempts>=4) THEN 1 ELSE 0 END) terminal,
+      SUM(CASE WHEN status='complete' THEN 1 ELSE 0 END) complete,
+      SUM(CASE WHEN status='skipped' THEN 1 ELSE 0 END) skipped,
+      MIN(CASE WHEN status IN ('pending','failed') AND attempts<4 AND next_retry_at>strftime('%Y-%m-%dT%H:%M:%fZ','now') THEN next_retry_at END) next_retry_at
+      FROM enrichment_queue`).get() as any;
+    return {eligibleNow:Number(row?.eligible_now??0),coolingDown:Number(row?.cooling_down??0),terminal:Number(row?.terminal??0),complete:Number(row?.complete??0),skipped:Number(row?.skipped??0),...(row?.next_retry_at?{nextRetryAt:String(row.next_retry_at)}:{})};
+  }
+  reconcileDiscoveryForecast(runId:string):void {const pending=this.pendingEnrichmentCount(runId);this.db.prepare("UPDATE discovery_forecasts SET actual_new_strong=?,reconciled_at=? WHERE run_id=?").run(this.actualNewStrongMatches(runId),pending?null:new Date().toISOString(),runId);}
+  discoveryForecastSnapshot(runId:string):unknown {const row=this.db.prepare("SELECT * FROM discovery_forecasts WHERE run_id=?").get(runId) as any;return row?{...row,reconciliationStatus:this.pendingEnrichmentCount(runId)?'provisional':'final',pendingEnrichments:this.pendingEnrichmentCount(runId),input:JSON.parse(row.input_json),prediction:JSON.parse(row.prediction_json),input_json:undefined,prediction_json:undefined}:undefined;}
+  resumeDiscoveryRun(id: string): void { const row=this.db.prepare("SELECT source_id,limit_count,mode,worker_count FROM discovery_runs WHERE id=?").get(id) as any;if(!row)throw new Error("Discovery run not found");const claimed=this.claimDiscoveryRun(id,row.source_id??undefined,Number(row.limit_count),undefined,row.mode??'balanced',Number(row.worker_count??6),true);if(!claimed.claimed)throw Object.assign(new Error("A discovery run is already active"),{statusCode:409,activeRun:claimed.activeRun}); }
   finishDiscoveryRun(id: string, result: { status: string; processed: number; employers: number; matching: number; nonmatching: number; errors: number; noNl?: number; empty?: number; retryableErrors?: number; permanentErrors?: number; durationMs?: number; checkpoint?: unknown; fetched?: number; newJobs?: number; refreshedJobs?: number; missingBoards?: number; unsupported?: number; partialCollections?: number; descriptionCandidates?:number; enrichedJobs?:number; deferredEnrichments?:number; descriptionMatches?:number; enrichmentFailures?:number }): void {
     this.db.prepare("UPDATE discovery_runs SET finished_at=?,heartbeat_at=?,status=?,phase=?,phase_message=?,processed_count=?,employer_count=?,matching_jobs=?,nonmatching_jobs=?,error_count=?,no_nl_count=?,empty_count=?,retryable_error_count=?,permanent_error_count=?,duration_ms=?,checkpoint_json=?,fetched_jobs=?,new_jobs=?,refreshed_jobs=?,missing_board_count=?,unsupported_count=?,partial_collection_count=?,description_candidate_count=?,enriched_job_count=?,deferred_enrichment_count=?,description_match_count=?,enrichment_failure_count=? WHERE id=?").run(new Date().toISOString(), new Date().toISOString(), result.status,result.status==="interrupted"?"cancelled":"completed",result.status==="interrupted"?"Cancelled safely; queue can be resumed":"Discovery finished", result.processed, result.employers, result.matching, result.nonmatching, result.errors, result.noNl ?? 0, result.empty ?? 0, result.retryableErrors ?? 0, result.permanentErrors ?? 0, result.durationMs ?? 0, JSON.stringify(result.checkpoint ?? {}), result.fetched ?? 0, result.newJobs ?? 0, result.refreshedJobs ?? 0, result.missingBoards ?? 0, result.unsupported ?? 0, result.partialCollections ?? 0,result.descriptionCandidates??0,result.enrichedJobs??0,result.deferredEnrichments??0,result.descriptionMatches??0,result.enrichmentFailures??0,id);
+    this.reconcileDiscoveryForecast(id);
     this.clearDiscoveryTasks(id);
   }
   updateDiscoveryCheckpoint(id: string, checkpoint: unknown, counts: { processed: number; employers: number; matching: number; nonmatching: number; errors: number; noNl: number; empty: number; retryableErrors: number; permanentErrors: number }): void { this.db.prepare("UPDATE discovery_runs SET heartbeat_at=?,checkpoint_json=?,processed_count=?,employer_count=?,matching_jobs=?,nonmatching_jobs=?,error_count=?,no_nl_count=?,empty_count=?,retryable_error_count=?,permanent_error_count=? WHERE id=?").run(new Date().toISOString(), JSON.stringify(checkpoint), counts.processed, counts.employers, counts.matching, counts.nonmatching, counts.errors, counts.noNl, counts.empty, counts.retryableErrors, counts.permanentErrors, id); }
   recoverStaleDiscoveryRuns(staleMs = 120_000): number { const cutoff = new Date(Date.now() - staleMs).toISOString(),ids=(this.db.prepare("SELECT id FROM discovery_runs WHERE status='running' AND (heartbeat_at IS NULL OR heartbeat_at<?)").all(cutoff) as any[]).map(row=>row.id);if(!ids.length)return 0;const now=new Date().toISOString();for(const id of ids){this.db.prepare("UPDATE discovery_runs SET status='interrupted',phase='cancelled',phase_message='Process heartbeat stopped; queue can be resumed',finished_at=?,heartbeat_at=? WHERE id=?").run(now,now,id);this.clearDiscoveryTasks(id);}return ids.length; }
   interruptDiscoveryRun(id: string): void { this.db.prepare("UPDATE discovery_runs SET status='interrupted',phase='cancelled',phase_message='Interrupted; queue can be resumed',finished_at=?,heartbeat_at=? WHERE id=? AND status='running'").run(new Date().toISOString(), new Date().toISOString(), id);this.clearDiscoveryTasks(id); }
   incompleteDiscoveryRun(sourceId?: string): { id: string; checkpoint: any; row: any } | null { const row = this.db.prepare("SELECT * FROM discovery_runs WHERE (status IN ('running','interrupted') OR (status='partial' AND EXISTS(SELECT 1 FROM discovery_queue q WHERE q.run_id=discovery_runs.id AND q.status='pending'))) AND COALESCE(source_id,'')=COALESCE(?,'') ORDER BY started_at DESC LIMIT 1").get(sourceId ?? null) as any; return row ? { id: row.id, checkpoint: JSON.parse(row.checkpoint_json), row } : null; }
-  enqueueDiscoveryCandidates(runId: string, rows: Array<{ id: string; candidate: DiscoveryCandidate }>): void {
+  enqueueDiscoveryCandidates(runId: string, rows: Array<{ id: string; candidate: DiscoveryCandidate }>): {queued:number;duplicates:number} {
     const statement = this.db.prepare("INSERT OR IGNORE INTO discovery_queue(run_id,ordinal,candidate_id,source_id,candidate_json,status,updated_at) VALUES(?,?,?,?,?,'pending',?)");
-    const now = new Date().toISOString(); this.db.exec("BEGIN IMMEDIATE");
-    try { rows.forEach((row, ordinal) => statement.run(runId, ordinal, row.id, row.candidate.sourceId, JSON.stringify(row.candidate), now)); this.db.exec("COMMIT"); }
+    const now = new Date().toISOString();let queued=0,duplicates=0;this.db.exec("BEGIN IMMEDIATE");
+    try { const existing=new Set((this.db.prepare("SELECT candidate_id FROM discovery_queue WHERE run_id=?").all(runId) as any[]).map(row=>String(row.candidate_id)));let ordinal=Number((this.db.prepare("SELECT COALESCE(MAX(ordinal),-1) ordinal FROM discovery_queue WHERE run_id=?").get(runId) as any)?.ordinal??-1)+1;for(const row of rows){if(existing.has(row.id)){duplicates++;continue;}const result=statement.run(runId,ordinal,row.id,row.candidate.sourceId,JSON.stringify(row.candidate),now);if(Number(result.changes)){queued++;ordinal++;existing.add(row.id);}else duplicates++;}this.db.exec("COMMIT"); }
     catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    return {queued,duplicates};
   }
   discoveryQueue(runId: string, statuses = ["pending"]): Array<{ ordinal: number; candidateId: string; candidate: DiscoveryCandidate }> {
     const placeholders = statuses.map(() => "?").join(",");
@@ -442,7 +516,7 @@ export class Store {
   }
   markDiscoveryQueue(runId: string, candidateId: string, status: string, result?: string): void { this.db.prepare("UPDATE discovery_queue SET status=?,result=?,updated_at=? WHERE run_id=? AND candidate_id=?").run(status, result ?? null, new Date().toISOString(), runId, candidateId); }
   pendingDiscoveryCount(runId: string): number { return Number((this.db.prepare("SELECT COUNT(*) count FROM discovery_queue WHERE run_id=? AND status='pending'").get(runId) as any).count); }
-  recordDiscoveryAttempt(attempt: DiscoveryAttempt): void { this.db.prepare(`INSERT INTO discovery_attempts(run_id,source_id,company,board_url,provider,started_at,duration_ms,result,http_status,retryable,error_message,jobs_fetched,netherlands_jobs,profile_matches,candidate_json,collection_partial,continuation) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(run_id,source_id,company,board_url) DO UPDATE SET started_at=excluded.started_at,duration_ms=excluded.duration_ms,result=excluded.result,http_status=excluded.http_status,retryable=excluded.retryable,error_message=excluded.error_message,jobs_fetched=excluded.jobs_fetched,netherlands_jobs=excluded.netherlands_jobs,profile_matches=excluded.profile_matches,candidate_json=excluded.candidate_json,collection_partial=excluded.collection_partial,continuation=excluded.continuation`).run(attempt.runId, attempt.sourceId, attempt.company, attempt.boardUrl ?? null, attempt.provider ?? null, attempt.startedAt, attempt.durationMs, attempt.result, attempt.httpStatus ?? null, attempt.retryable ? 1 : 0, attempt.errorMessage?.slice(0, 1000) ?? null, attempt.jobsFetched, attempt.netherlandsJobs, attempt.profileMatches, JSON.stringify(attempt.candidate), attempt.collectionPartial ? 1 : 0, attempt.continuation ?? null); }
+  recordDiscoveryAttempt(attempt: DiscoveryAttempt): void { this.db.prepare(`INSERT INTO discovery_attempts(run_id,source_id,company,board_url,provider,started_at,duration_ms,result,http_status,retryable,error_message,jobs_fetched,netherlands_jobs,profile_matches,candidate_json,collection_partial,continuation,collection_duration_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(run_id,source_id,company,board_url) DO UPDATE SET started_at=excluded.started_at,duration_ms=excluded.duration_ms,result=excluded.result,http_status=excluded.http_status,retryable=excluded.retryable,error_message=excluded.error_message,jobs_fetched=excluded.jobs_fetched,netherlands_jobs=excluded.netherlands_jobs,profile_matches=excluded.profile_matches,candidate_json=excluded.candidate_json,collection_partial=excluded.collection_partial,continuation=excluded.continuation,collection_duration_ms=excluded.collection_duration_ms`).run(attempt.runId, attempt.sourceId, attempt.company, attempt.boardUrl ?? null, attempt.provider ?? null, attempt.startedAt, attempt.durationMs, attempt.result, attempt.httpStatus ?? null, attempt.retryable ? 1 : 0, attempt.errorMessage?.slice(0, 1000) ?? null, attempt.jobsFetched, attempt.netherlandsJobs, attempt.profileMatches, JSON.stringify(attempt.candidate), attempt.collectionPartial ? 1 : 0, attempt.continuation ?? null,attempt.collectionDurationMs??null); }
   discoveryFailures(query: { retryable?: boolean; source?: string; limit?: number; history?: boolean; includeMissing?: boolean } = {}): unknown[] {
     const params: any[] = [];
     if (query.history) {
@@ -542,9 +616,9 @@ export class Store {
   employerCount(query: EmployerQuery = {}): number { const copy={...query,limit:1,offset:0}; const clauses: string[] = [], params: any[]=[]; if(copy.name){clauses.push("LOWER(e.canonical_name) LIKE ?");params.push(`%${copy.name.toLowerCase()}%`)} if(copy.headquarters){clauses.push("e.headquarters=?");params.push(copy.headquarters)} if(copy.hiring!==undefined)clauses.push(copy.hiring?"EXISTS(SELECT 1 FROM vacancy_observations v WHERE v.employer_id=e.id AND v.observed_at>=datetime('now','-30 days'))":"NOT EXISTS(SELECT 1 FROM vacancy_observations v WHERE v.employer_id=e.id AND v.observed_at>=datetime('now','-30 days'))"); if(copy.provider){clauses.push("EXISTS(SELECT 1 FROM employer_boards b WHERE b.employer_id=e.id AND b.provider=?)");params.push(copy.provider)} if(copy.source){clauses.push("EXISTS(SELECT 1 FROM employer_aliases a WHERE a.employer_id=e.id AND a.source_id=?)");params.push(copy.source)} if(copy.boardStatus){clauses.push("EXISTS(SELECT 1 FROM employer_boards b WHERE b.employer_id=e.id AND b.status=?)");params.push(copy.boardStatus)} if(copy.matches!==undefined)clauses.push(`${copy.matches?"":"NOT "}EXISTS(SELECT 1 FROM vacancy_observations v WHERE v.employer_id=e.id AND v.matched_profile=1 AND v.observed_at>=datetime('now','-30 days'))`); if(copy.benchmark!==undefined)clauses.push(`${copy.benchmark?"":"NOT "}EXISTS(SELECT 1 FROM benchmark_matches bm WHERE bm.employer_id=e.id AND bm.review_state='matched')`); return Number((this.db.prepare(`SELECT COUNT(*) count FROM employers e ${clauses.length?`WHERE ${clauses.join(" AND ")}`:""}`).get(...params) as any).count); }
   employer(id: string): unknown { const employer = this.db.prepare("SELECT * FROM employers WHERE id=?").get(id) as any; if (!employer) return undefined; return { ...employer, aliases: this.db.prepare("SELECT alias,source_id sourceId FROM employer_aliases WHERE employer_id=?").all(id), boards: this.db.prepare("SELECT * FROM employer_boards WHERE employer_id=? ORDER BY last_checked_at DESC").all(id), observations: this.db.prepare("SELECT * FROM vacancy_observations WHERE employer_id=? ORDER BY observed_at DESC LIMIT 200").all(id), jobs: this.db.prepare("SELECT j.id,j.title,j.location,j.overall_score,j.status,j.canonical_url,j.first_seen_at,j.last_seen_at FROM jobs j WHERE EXISTS(SELECT 1 FROM vacancy_observations v WHERE v.employer_id=? AND v.fingerprint=j.fingerprint) ORDER BY j.overall_score DESC").all(id), attempts: this.db.prepare("SELECT source_id,provider,board_url,result,started_at,duration_ms,jobs_fetched,netherlands_jobs,profile_matches,error_message FROM discovery_attempts WHERE LOWER(company)=LOWER(?) ORDER BY started_at DESC LIMIT 100").all(employer.canonical_name), benchmark: this.db.prepare("SELECT be.*,bm.match_method,bm.review_state FROM benchmark_matches bm JOIN benchmark_employers be ON be.panel_version=bm.panel_version AND be.benchmark_id=bm.benchmark_id WHERE bm.employer_id=?").get(id) }; }
   discoverySourceRows(): unknown[] { return this.db.prepare("SELECT * FROM discovery_sources ORDER BY id").all(); }
-  sourceYieldEvidence(sourceId:string):{attempts:number;averageDurationMs:number;matchYield:number}|undefined {
-    const row=this.db.prepare("SELECT COUNT(*) attempts,COALESCE(AVG(duration_ms),0) averageDurationMs,COALESCE(SUM(profile_matches),0) matches FROM discovery_attempts WHERE source_id=? AND started_at>=datetime('now','-30 days')").get(sourceId) as any;
-    const attempts=Number(row?.attempts??0);return attempts?{attempts,averageDurationMs:Number(row.averageDurationMs),matchYield:Number(row.matches)/attempts}:undefined;
+  sourceYieldEvidence(sourceId:string):{attempts:number;averageDurationMs:number;matchYield:number;failureRate:number;matches:number}|undefined {
+    const row=this.db.prepare("SELECT COUNT(*) attempts,COALESCE(AVG(COALESCE(collection_duration_ms,duration_ms)),0) averageDurationMs,COALESCE(SUM(profile_matches),0) matches,COALESCE(SUM(CASE WHEN result IN ('timeout','rate-limited','network-error','parse-error','invalid-record') THEN 1 ELSE 0 END),0) failures FROM discovery_attempts WHERE source_id=? AND started_at>=datetime('now','-30 days')").get(sourceId) as any;
+    const attempts=Number(row?.attempts??0),matches=Number(row?.matches??0);return attempts?{attempts,matches,averageDurationMs:Number(row.averageDurationMs),matchYield:matches/attempts,failureRate:Number(row.failures)/attempts}:undefined;
   }
   private discoveryEta(row:any,pending:number):unknown {
     if(row.status!=="running")return null;
@@ -564,8 +638,9 @@ export class Store {
     if(!historical.length)return {seconds:null,lowerSeconds:null,upperSeconds:null,confidence:"low",basis:"Collecting timing evidence"};
     const workers=Math.min(Math.max(1,Number(row.worker_count??4)),Math.max(1,pending)),scheduled=(key:"median"|"low"|"high")=>{const workerReady=Array(workers).fill(0),hostReady=new Map<string,number[]>();for(const item of workItems){const slots=hostReady.get(item.host)??Array(item.hostLimit).fill(0);hostReady.set(item.host,slots);if(item.active){const worker=Math.min(workers-1,Math.max(0,item.active.worker)),hostSlot=slots.indexOf(Math.min(...slots)),duration=item[key];workerReady[worker]=Math.max(workerReady[worker],duration);slots[hostSlot]=Math.max(slots[hostSlot],duration);}}const queuedWork=workItems.filter(item=>!item.active).sort((a,b)=>b[key]-a[key]);for(const item of queuedWork){const workerSlot=workerReady.indexOf(Math.min(...workerReady)),slots=hostReady.get(item.host)!,hostSlot=slots.indexOf(Math.min(...slots)),start=Math.max(workerReady[workerSlot],slots[hostSlot]),finish=start+item[key];workerReady[workerSlot]=finish;slots[hostSlot]=finish;}return Math.max(...workerReady);},seconds=Math.round(scheduled("median")/1000);return {seconds,lowerSeconds:Math.round(scheduled("low")/1000),upperSeconds:Math.max(seconds,Math.round(scheduled("high")/1000)),confidence:modelled>=Math.min(20,pending)?"high":modelled>=Math.min(5,pending)?"medium":"low",basis:`${modelled} queued candidates matched to ${workers} workers, source timings and per-host limits`};
   }
-  private explainRun(row: any): any { const reasons: string[] = []; if (row.error_count) reasons.push(`${row.error_count} operational error${row.error_count === 1 ? "" : "s"}`); if (row.missing_board_count) reasons.push(`${row.missing_board_count} missing board${row.missing_board_count === 1 ? "" : "s"}`); if (row.partial_collection_count) reasons.push(`${row.partial_collection_count} partial board collection${row.partial_collection_count === 1 ? "" : "s"}`); const pending = Number((this.db.prepare("SELECT COUNT(*) count FROM discovery_queue WHERE run_id=? AND status='pending'").get(row.id) as any)?.count ?? 0),shortfall=row.shortfall_json?JSON.parse(row.shortfall_json):[]; if (pending) reasons.push(`${pending} pending candidate${pending === 1 ? "" : "s"}`); if(Number(row.unfilled_count??0)>0)reasons.push(`${row.unfilled_count} requested slot${row.unfilled_count===1?"":"s"} unfilled by selected sources`); const displayStatus = row.status === "completed" ? "Completed" : row.status === "partial" ? "Completed with issues" : row.status === "interrupted" ? "Interrupted — resumable" : row.status === "failed" ? "Failed" : "Running",policy=row.selection_policy??"legacy-auto-fallback",sourceExplanation=shortfall.map((item:any)=>`${item.label} returned ${item.returned}, skipped ${item.skippedRecent} recent, merged ${item.duplicates} duplicate${item.duplicates===1?"":"s"}, and queued ${item.queued}`).join("; "),completionSummary=row.status==="running"?null:`Completed ${row.processed_count} of ${row.limit_count} requested${sourceExplanation?`: ${sourceExplanation}`:""}${Number(row.unfilled_count??0)>0?"; no other sources were used":""}.`; return { ...row, plan:row.plan_json?JSON.parse(row.plan_json):null, plan_json:undefined, shortfall_json:undefined,shortfall,selection_policy:policy,selection_policy_label:policy==="strict"?"Strict source selection":policy==="legacy-auto-fallback"?"Legacy automatic fallback":"Explicit single source",completion_summary:completionSummary,pending_count: pending, display_status: displayStatus, status_reasons: reasons }; }
-  discoveryRuns(): unknown[] { return (this.db.prepare("SELECT * FROM discovery_runs ORDER BY started_at DESC LIMIT 100").all() as any[]).map(row => {const explained:any=this.explainRun(row);return {...explained,mode:row.mode??"balanced",phase:row.phase??(row.status==="running"?"processing":"completed"),eta:this.discoveryEta(row,explained.pending_count),sources:row.plan_json?this.discoveryRunSources(row.id):[]};}); }
+  private explainRun(row: any): any { const reasons: string[] = []; if (row.error_count) reasons.push(`${row.error_count} operational error${row.error_count === 1 ? "" : "s"}`); if (row.missing_board_count) reasons.push(`${row.missing_board_count} missing board${row.missing_board_count === 1 ? "" : "s"}`); if (row.partial_collection_count) reasons.push(`${row.partial_collection_count} partial board collection${row.partial_collection_count === 1 ? "" : "s"}`); const pending = Number((this.db.prepare("SELECT COUNT(*) count FROM discovery_queue WHERE run_id=? AND status='pending'").get(row.id) as any)?.count ?? 0),shortfall=row.shortfall_json?JSON.parse(row.shortfall_json):[]; if (pending) reasons.push(`${pending} pending candidate${pending === 1 ? "" : "s"}`); if(Number(row.unfilled_count??0)>0)reasons.push(`${row.unfilled_count} requested slot${row.unfilled_count===1?"":"s"} unfilled by selected sources`);if(row.time_budget_ms&&Number(row.metrics_version??1)<2)reasons.push("Legacy adaptive metrics: duplicate counts may include queue-position collisions"); const displayStatus = row.status === "completed" ? "Completed" : row.status === "partial" ? "Completed with issues" : row.status === "interrupted" ? "Interrupted — resumable" : row.status === "failed" ? "Failed" : "Running",policy=row.selection_policy??"legacy-auto-fallback",sourceExplanation=shortfall.map((item:any)=>`${item.label} returned ${item.returned}, skipped ${item.skippedRecent} recent, merged ${item.duplicates} duplicate${item.duplicates===1?"":"s"}, and queued ${item.queued}`).join("; "),completionSummary=row.status==="running"?null:row.time_budget_ms?`${row.time_budget_ms/60000} minutes · ${row.new_strong_count??0} new strong · ${row.useful_match_count??0} reward-eligible · ${Number(row.weighted_reward??0).toFixed(1)} weighted reward`:`Completed ${row.processed_count} of ${row.limit_count} requested${sourceExplanation?`: ${sourceExplanation}`:""}${Number(row.unfilled_count??0)>0&&policy!=="turbo-tiered"?"; no other sources were used":""}.`; return { ...row, plan:row.plan_json?JSON.parse(row.plan_json):null, plan_json:undefined, shortfall_json:undefined,shortfall,selection_policy:policy,selection_policy_label:policy==="adaptive-time"?"Adaptive time window":policy==="turbo-tiered"?"Turbo tiered selection":policy==="strict"?"Strict source selection":policy==="legacy-auto-fallback"?"Legacy automatic fallback":"Explicit single source",completion_summary:completionSummary,pending_count: pending, display_status: displayStatus, status_reasons: reasons }; }
+  private runSourcesWithPlan(runId:string,plan:any):any[]{const metadata=new Map<string,any>((plan?.sources??[]).map((item:any)=>[item.id,item]));return (this.discoveryRunSources(runId) as any[]).map(row=>({...row,...(metadata.get(row.source_id)??{}),source_id:row.source_id}));}
+  discoveryRuns(): unknown[] { return (this.db.prepare("SELECT * FROM discovery_runs ORDER BY started_at DESC LIMIT 100").all() as any[]).map(row => {const explained:any=this.explainRun(row);return {...explained,mode:row.mode??"balanced",phase:row.phase??(row.status==="running"?"processing":"completed"),eta:this.discoveryEta(row,explained.pending_count),sources:row.plan_json?this.runSourcesWithPlan(row.id,explained.plan):[]};}); }
   coverage(): unknown {
     const scalar = (sql: string) => Number((this.db.prepare(sql).get() as any).value);
     return { employers: scalar("SELECT COUNT(*) value FROM employers"), hiringEmployers: scalar("SELECT COUNT(*) value FROM employers WHERE active_nl_vacancies>0"), matchingVacancies: scalar("SELECT COUNT(*) value FROM vacancy_observations WHERE matched_profile=1"), nonmatchingVacancies: scalar("SELECT COUNT(*) value FROM vacancy_observations WHERE matched_profile=0"), byHeadquarters: this.db.prepare("SELECT headquarters,COUNT(*) count FROM employers GROUP BY headquarters").all(), bySizeConfidence: this.db.prepare("SELECT size_confidence confidence,COUNT(*) count FROM employers GROUP BY size_confidence").all(), byBoardStatus: this.db.prepare("SELECT status,COUNT(*) count FROM employer_boards GROUP BY status").all(), byProvider: this.db.prepare("SELECT COALESCE(provider,'unsupported') provider,COUNT(*) count FROM employer_boards GROUP BY provider").all(), attemptsByResult: this.db.prepare("SELECT result,COUNT(*) count FROM discovery_attempts GROUP BY result ORDER BY count DESC").all(), currentCandidateHealth: this.db.prepare("SELECT latest_result result,COUNT(*) count FROM discovery_candidate_health GROUP BY latest_result ORDER BY count DESC").all(), failuresByReason: this.db.prepare("SELECT latest_result result,COUNT(*) count FROM discovery_candidate_health WHERE retryable=1 OR latest_result IN ('parse-error','invalid-record') GROUP BY latest_result ORDER BY count DESC").all(), sourceQualityFindings: this.db.prepare("SELECT latest_result result,COUNT(*) count FROM discovery_candidate_health WHERE latest_result='board-not-found' GROUP BY latest_result").all(), failuresBySource: this.db.prepare("SELECT source_id sourceId,latest_result result,COUNT(*) count FROM discovery_candidate_health WHERE retryable=1 OR latest_result IN ('parse-error','invalid-record') GROUP BY source_id,latest_result ORDER BY count DESC").all(), sources: this.db.prepare("SELECT id,cursor,total_items totalItems,processed_total processedTotal,last_success_at lastSuccessAt,last_error lastError,CASE WHEN total_items>0 THEN ROUND(cursor*100.0/total_items,1) ELSE 0 END cyclePercent FROM discovery_sources ORDER BY id").all() };
@@ -576,7 +651,7 @@ export class Store {
     if (type === "discovery") return { type, window, items: this.db.prepare(`WITH ids AS (SELECT id FROM discovery_sources UNION SELECT DISTINCT source_id id FROM discovery_attempts), metrics AS (
       SELECT ids.id,COUNT(da.id) attempts,SUM(CASE WHEN da.result NOT IN ('timeout','rate-limited','network-error','parse-error','invalid-record') THEN 1 ELSE 0 END) reliable_attempts,
       SUM(CASE WHEN da.result NOT IN ('board-not-found','invalid-record') THEN 1 ELSE 0 END) valid_records,SUM(CASE WHEN da.netherlands_jobs>0 THEN 1 ELSE 0 END) nl_candidates,
-      COALESCE(SUM(da.netherlands_jobs),0) nl_vacancies,COALESCE(SUM(da.profile_matches),0) profile_matches,COALESCE(AVG(da.duration_ms),0) avg_duration_ms,
+      COALESCE(SUM(da.netherlands_jobs),0) nl_vacancies,COALESCE(SUM(da.profile_matches),0) profile_matches,COALESCE(AVG(COALESCE(da.collection_duration_ms,da.duration_ms)),0) avg_duration_ms,
       SUM(CASE WHEN da.result IN ('timeout','rate-limited','network-error','parse-error','invalid-record') THEN 1 ELSE 0 END) operational_failures,
       SUM(CASE WHEN da.result='board-not-found' THEN 1 ELSE 0 END) missing_boards
       FROM ids LEFT JOIN discovery_attempts da ON da.source_id=ids.id ${attemptWhere} GROUP BY ids.id)
@@ -595,7 +670,7 @@ export class Store {
     return { type, window, items: this.db.prepare(`WITH ids AS (SELECT DISTINCT COALESCE(provider,'unsupported') id FROM employer_boards UNION SELECT DISTINCT COALESCE(provider,'unsupported') FROM discovery_attempts), metrics AS (
       SELECT ids.id,COUNT(da.id) attempts,SUM(CASE WHEN da.result NOT IN ('timeout','rate-limited','network-error','parse-error','invalid-record') THEN 1 ELSE 0 END) reliable_attempts,
       COALESCE(SUM(da.jobs_fetched),0) fetched_vacancies,COALESCE(SUM(da.netherlands_jobs),0) nl_vacancies,COALESCE(SUM(da.profile_matches),0) profile_matches,
-      COALESCE(AVG(da.duration_ms),0) avg_duration_ms,SUM(CASE WHEN da.result IN ('timeout','rate-limited','network-error','parse-error','invalid-record') THEN 1 ELSE 0 END) operational_failures
+      COALESCE(AVG(COALESCE(da.collection_duration_ms,da.duration_ms)),0) avg_duration_ms,SUM(CASE WHEN da.result IN ('timeout','rate-limited','network-error','parse-error','invalid-record') THEN 1 ELSE 0 END) operational_failures
       FROM ids LEFT JOIN discovery_attempts da ON COALESCE(da.provider,'unsupported')=ids.id ${attemptWhere} GROUP BY ids.id)
       SELECT m.*,(SELECT COUNT(*) FROM employer_boards b WHERE COALESCE(b.provider,'unsupported')=m.id) boards,
       (SELECT COUNT(*) FROM employer_boards b WHERE COALESCE(b.provider,'unsupported')=m.id AND b.status='healthy') healthy_boards,
@@ -703,19 +778,26 @@ export class Store {
     this.db.prepare(`UPDATE jobs SET missed_scans=missed_scans+1,status=CASE WHEN missed_scans+1>=? THEN 'expired' ELSE 'uncertain' END
       WHERE source_id=? AND last_seen_at<?`).run(threshold, sourceId, scanStartedAt);
   }
-  updateJobQuality(id: string, values: { description?: string; enrichmentStatus?: string; enrichmentError?: string; ruleScore: number; overallScore: number; breakdown: ScoreLedger; scoringVersion: string; profileFingerprint: string; seniority: string; workArrangement?: string }): void {
+  updateJobQuality(id: string, values: { description?: string; enrichmentStatus?: string; enrichmentError?: string; ruleScore: number; overallScore: number; breakdown: ScoreLedger; scoringVersion: string; profileFingerprint: string; seniority: string; workArrangement?: string; locationAccess: LocationAccessAssessment }): void {
     const now = values.breakdown.calculatedAt ?? new Date().toISOString();
-    this.db.prepare(`UPDATE jobs SET description=COALESCE(?,description),enrichment_status=?,enrichment_error=?,enriched_at=?,rule_score=?,overall_score=?,score_breakdown_json=?,scoring_version=?,profile_fingerprint=?,seniority=?,work_arrangement=COALESCE(?,work_arrangement),hard_excluded=?,exclusion_reason=?,score_calculated_at=? WHERE id=?`)
-      .run(values.description ?? null, values.enrichmentStatus ?? "not-needed", values.enrichmentError ?? null, new Date().toISOString(), values.ruleScore, values.overallScore, JSON.stringify(values.breakdown), values.scoringVersion, values.profileFingerprint, values.seniority, values.workArrangement ?? null, values.breakdown.hardExcluded ? 1 : 0, values.breakdown.exclusionReason ?? null, now, id);
+    this.db.prepare(`UPDATE jobs SET description=COALESCE(?,description),enrichment_status=?,enrichment_error=?,enriched_at=?,rule_score=?,overall_score=?,score_breakdown_json=?,scoring_version=?,profile_fingerprint=?,seniority=?,work_arrangement=COALESCE(?,work_arrangement),hard_excluded=?,exclusion_reason=?,score_calculated_at=?,location_access_tier=?,location_access_json=? WHERE id=?`)
+      .run(values.description ?? null, values.enrichmentStatus ?? "not-needed", values.enrichmentError ?? null, new Date().toISOString(), values.ruleScore, values.overallScore, JSON.stringify(values.breakdown), values.scoringVersion, values.profileFingerprint, values.seniority, values.workArrangement ?? null, values.breakdown.hardExcluded ? 1 : 0, values.breakdown.exclusionReason ?? null, now, values.locationAccess.tier, JSON.stringify(values.locationAccess), id);
     this.db.prepare("INSERT INTO job_score_events(job_id,calculated_at,scoring_version,profile_fingerprint,rule_score,ai_score,overall_score,ledger_json) VALUES(?,?,?,?,?,?,?,?)").run(id, now, values.scoringVersion, values.profileFingerprint, values.ruleScore, values.breakdown.aiScore ?? null, values.overallScore, JSON.stringify(values.breakdown));
   }
-  recordEnrichment(id: string, status: string, sourceUrl: string, error?: string): void { this.db.prepare("INSERT INTO job_enrichment_events(job_id,occurred_at,status,source_url,error_message) VALUES(?,?,?,?,?)").run(id, new Date().toISOString(), status, sourceUrl, error?.slice(0,500) ?? null); }
+  backfillLocationAccess(profile: import('./types.js').ProfileConfig, limit=500): number {
+    const rows=this.db.prepare("SELECT id,location,work_arrangement,raw_json FROM jobs WHERE location_access_tier IS NULL LIMIT ?").all(Math.min(Math.max(limit,1),5000)) as any[];
+    if(!rows.length)return 0;
+    const update=this.db.prepare("UPDATE jobs SET location_access_tier=?,location_access_json=? WHERE id=?");
+    return this.transaction(()=>{for(const row of rows){let raw={};try{raw=JSON.parse(row.raw_json??'{}')}catch{}const access=classifyLocationAccess({location:row.location??'',workArrangement:row.work_arrangement??'unknown',raw},profile);update.run(access.tier,JSON.stringify(access),row.id);}return rows.length;});
+  }
+  recordEnrichment(id: string, status: string, sourceUrl: string, error?: string, durationMs?:number): void { this.db.prepare("INSERT INTO job_enrichment_events(job_id,occurred_at,status,source_url,error_message,duration_ms) VALUES(?,?,?,?,?,?)").run(id, new Date().toISOString(), status, sourceUrl, error?.slice(0,500) ?? null,durationMs??null); }
   queueEnrichment(id: string, job: unknown, candidate: DiscoveryCandidate, employerId: string | undefined, runId: string): void { const now=new Date().toISOString(); this.db.prepare(`INSERT INTO enrichment_queue(id,job_json,candidate_json,employer_id,discovery_run_id,status,created_at,updated_at) VALUES(?,?,?,?,?,'pending',?,?) ON CONFLICT(id) DO UPDATE SET job_json=excluded.job_json,candidate_json=excluded.candidate_json,employer_id=COALESCE(excluded.employer_id,enrichment_queue.employer_id),updated_at=excluded.updated_at WHERE enrichment_queue.status!='complete'`).run(id,JSON.stringify(job),JSON.stringify(candidate),employerId??null,runId,now,now); }
   pendingEnrichments(limit=100): any[] { return this.db.prepare("SELECT * FROM enrichment_queue WHERE status IN ('pending','failed') AND attempts<4 AND (next_retry_at IS NULL OR next_retry_at<=strftime('%Y-%m-%dT%H:%M:%fZ','now')) ORDER BY created_at LIMIT ?").all(Math.min(Math.max(limit,1),500)) as any[]; }
-  finishQueuedEnrichment(id:string,status:"complete"|"failed"|"skipped",error?:string,retryAfterMs?:number):void {
+  finishQueuedEnrichment(id:string,status:"complete"|"failed"|"skipped"|"terminal",error?:string,retryAfterMs?:number):void {
     const row=this.db.prepare('SELECT attempts FROM enrichment_queue WHERE id=?').get(id) as any;
     const attempts=Number(row?.attempts??0)+1, delay=retryAfterMs??[900000,3600000,21600000,86400000][Math.min(attempts-1,3)];
-    this.db.prepare('UPDATE enrichment_queue SET status=?,attempts=?,last_error=?,updated_at=?,next_retry_at=?,retry_after_ms=? WHERE id=?').run(status,attempts,error?.slice(0,500)??null,new Date().toISOString(),status==='failed'?new Date(Date.now()+delay).toISOString():null,retryAfterMs??null,id);
+    const finalStatus=status==='failed'&&attempts>=4?'terminal':status;
+    this.db.prepare('UPDATE enrichment_queue SET status=?,attempts=?,last_error=?,updated_at=?,next_retry_at=?,retry_after_ms=? WHERE id=?').run(finalStatus,attempts,error?.slice(0,500)??null,new Date().toISOString(),finalStatus==='failed'?new Date(Date.now()+delay).toISOString():null,retryAfterMs??null,id);
   }
   retryEnrichment(id:string):void { this.db.prepare("UPDATE enrichment_queue SET status='pending',attempts=0,next_retry_at=NULL WHERE id=? AND status!='complete'").run(id); }
   enrichmentQueueCounts():unknown { return this.db.prepare("SELECT status,COUNT(*) count FROM enrichment_queue GROUP BY status ORDER BY status").all(); }
@@ -762,8 +844,7 @@ export class Store {
     const clauses: string[] = [], params: any[] = [];
     const like = (column: string, value?: string) => { if (value) { clauses.push(`LOWER(${column}) LIKE ?`); params.push(`%${value.toLowerCase()}%`); } };
     like("company", query.company); like("location", query.location);
-    if (query.locationGroup === "amsterdam") clauses.push("LOWER(location) LIKE '%amsterdam%'");
-    if (query.locationGroup === "outside-amsterdam") clauses.push("LOWER(COALESCE(location,'')) NOT LIKE '%amsterdam%'");
+    if (query.locationAccess) { clauses.push("location_access_tier=?"); params.push(query.locationAccess); }
     if (query.roleFamily) { clauses.push("role_family=?"); params.push(query.roleFamily); }
     if (query.provider) { clauses.push("provider=?"); params.push(query.provider); }
     if (query.status) { clauses.push("status=?"); params.push(query.status); }
@@ -830,7 +911,17 @@ export class Store {
       scoreDistribution: this.db.prepare("SELECT (COALESCE(overall_score,0)/10)*10 bucket,COUNT(*) count FROM jobs GROUP BY bucket ORDER BY bucket").all(),
     };
   }
-  discoveryRun(id: string): unknown { const row = this.db.prepare("SELECT * FROM discovery_runs WHERE id=?").get(id) as any;if(!row)return undefined;const explained:any=this.explainRun(row);return { ...explained,mode:row.mode??"balanced",phase:row.phase??(row.status==="running"?"processing":"completed"),eta:this.discoveryEta(row,explained.pending_count),sources:this.discoveryRunSources(id),active_tasks:this.db.prepare("SELECT *,CAST((julianday('now')-julianday(stage_started_at))*86400000 AS INTEGER) stage_elapsed_ms FROM discovery_run_tasks WHERE run_id=? ORDER BY worker_id").all(id), attempts: this.db.prepare("SELECT source_id,company,provider,board_url,result,http_status,retryable,duration_ms,jobs_fetched,netherlands_jobs,profile_matches,error_message,started_at FROM discovery_attempts WHERE run_id=? ORDER BY id DESC LIMIT 20").all(id) }; }
+  discoveryRun(id: string): unknown {
+    const row=this.db.prepare("SELECT * FROM discovery_runs WHERE id=?").get(id) as any;if(!row)return undefined;
+    const explained:any=this.explainRun(row),adaptive=Boolean(row.time_budget_ms),now=Date.now(),sources=adaptive?this.db.prepare(`SELECT p.source_id,MAX(p.label) label,COUNT(*) pulls,SUM(p.duration_ms) acquisition_ms,SUM(p.returned) returned_count,SUM(MAX(p.eligible-p.duplicates,0)) queued_count,SUM(p.duplicates) duplicate_count,SUM(p.failures) errors,
+      (SELECT COUNT(*) FROM discovery_attempts a WHERE a.run_id=p.run_id AND a.source_id=p.source_id) processed_candidates,
+      (SELECT COALESCE(SUM(a.jobs_fetched),0) FROM discovery_attempts a WHERE a.run_id=p.run_id AND a.source_id=p.source_id) jobs_fetched,
+      (SELECT COALESCE(SUM(o.new_strong),0) FROM discovery_outcomes o WHERE o.run_id=p.run_id AND o.source_id=p.source_id) new_strong_count,
+      (SELECT COUNT(*) FROM discovery_outcomes o WHERE o.run_id=p.run_id AND o.source_id=p.source_id AND o.new_strong=1 AND o.reward>0) useful_match_count,
+      (SELECT COALESCE(SUM(o.reward),0) FROM discovery_outcomes o WHERE o.run_id=p.run_id AND o.source_id=p.source_id) weighted_reward
+      FROM discovery_source_pulls p WHERE p.run_id=? GROUP BY p.run_id,p.source_id ORDER BY pulls DESC`).all(id):this.runSourcesWithPlan(id,explained.plan),pulls=(this.db.prepare("SELECT arm_id,source_id,label,started_at,duration_ms,returned,eligible,duplicates,failures,metadata_json FROM discovery_source_pulls WHERE run_id=? ORDER BY id DESC LIMIT 20").all(id) as any[]).map(pull=>({...pull,queued_unique:Math.max(0,Number(pull.eligible)-Number(pull.duplicates)),metadata:pull.metadata_json?JSON.parse(pull.metadata_json):null,metadata_json:undefined}));
+    return {...explained,mode:row.mode??"balanced",phase:adaptive&&row.status==="running"&&row.deadline_at&&now>=Date.parse(row.deadline_at)?"draining":row.phase??(row.status==="running"?"processing":"completed"),eta:adaptive?{seconds:row.status==="running"?Math.max(0,Math.ceil((Date.parse(row.deadline_at)-now)/1000)):0,lowerSeconds:null,upperSeconds:null,confidence:"fixed",basis:"Selected processing time"}:this.discoveryEta(row,explained.pending_count),forecast:this.discoveryForecastSnapshot(id),sources,active_tasks:this.db.prepare("SELECT *,CAST((julianday('now')-julianday(stage_started_at))*86400000 AS INTEGER) stage_elapsed_ms FROM discovery_run_tasks WHERE run_id=? ORDER BY worker_id").all(id),attempts:this.db.prepare("SELECT source_id,company,provider,board_url,result,http_status,retryable,duration_ms,jobs_fetched,netherlands_jobs,profile_matches,error_message,started_at FROM discovery_attempts WHERE run_id=? ORDER BY id DESC LIMIT 20").all(id),adaptive:adaptive?{durationMinutes:Number(row.time_budget_ms)/60000,deadlineAt:row.deadline_at,drainDeadlineAt:row.drain_deadline_at,remainingSeconds:row.status==="running"?Math.max(0,Math.ceil((Date.parse(row.deadline_at)-now)/1000)):0,currentConcurrency:Number(row.current_concurrency??0),metricsVersion:Number(row.metrics_version??1),pulls}:undefined};
+  }
   activeDiscoveryRun():unknown {this.recoverStaleDiscoveryRuns();const row=this.db.prepare("SELECT id FROM discovery_runs WHERE status='running' ORDER BY started_at DESC LIMIT 1").get() as any;return row?this.discoveryRun(row.id):null;}
   overview(): unknown {
     const list=(where:string)=>this.db.prepare(`SELECT jobs.*,(SELECT stage FROM applications a WHERE a.job_id=jobs.id) application_stage FROM jobs WHERE ${where} ORDER BY COALESCE(overall_score,0) DESC,COALESCE(posted_at,first_seen_at) DESC LIMIT 8`).all();

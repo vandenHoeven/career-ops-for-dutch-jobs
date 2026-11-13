@@ -339,6 +339,9 @@
     "utrecht",
     "eindhoven"
   ],
+  "locationPenalties": {
+    "amsterdam": 10
+  },
   "locationPreferences": {
     "anchor": {
       "city": "'s-Hertogenbosch",
@@ -368,7 +371,44 @@
     ],
     "distanceBandKm": 60,
     "includeRestOfNetherlands": true,
-    "foreignLocations": "exclude"
+    "foreignLocations": "exclude",
+    "accessibility": {
+      "easyMaxMinutes": 45,
+      "mediumMaxMinutes": 75,
+      "closeOverrideKm": 40,
+      "modePenalties": {
+        "direct-train": 0,
+        "train-transfer": 10,
+        "bus": 20
+      },
+      "cityProfiles": [
+        { "city": "Den Bosch", "aliases": ["'s-Hertogenbosch"], "distanceKm": 0, "publicTransportMinutes": 0, "mode": "direct-train", "source": "NS timetable", "updatedAt": "2026-11-13" },
+        { "city": "Vught", "distanceKm": 5, "publicTransportMinutes": 5, "mode": "direct-train", "source": "NS timetable", "updatedAt": "2026-11-13" },
+        { "city": "Rosmalen", "distanceKm": 7, "publicTransportMinutes": 6, "mode": "direct-train", "source": "NS timetable", "updatedAt": "2026-11-13" },
+        { "city": "Boxtel", "distanceKm": 16, "publicTransportMinutes": 12, "mode": "direct-train", "source": "NS timetable", "updatedAt": "2026-11-13" },
+        { "city": "Oss", "distanceKm": 20, "publicTransportMinutes": 17, "mode": "direct-train", "source": "NS timetable", "updatedAt": "2026-11-13" },
+        { "city": "Tilburg", "distanceKm": 27, "publicTransportMinutes": 16, "mode": "direct-train", "source": "NS timetable", "updatedAt": "2026-11-13" },
+        { "city": "Waalwijk", "distanceKm": 23, "publicTransportMinutes": 35, "mode": "bus", "source": "Typical 9292 journey", "updatedAt": "2026-11-13" },
+        { "city": "Veghel", "distanceKm": 25, "publicTransportMinutes": 40, "mode": "bus", "source": "Typical 9292 journey", "updatedAt": "2026-11-13" },
+        { "city": "Zaltbommel", "distanceKm": 16, "publicTransportMinutes": 12, "mode": "direct-train", "source": "NS timetable", "updatedAt": "2026-11-13" },
+        { "city": "Eindhoven", "distanceKm": 31, "publicTransportMinutes": 19, "mode": "direct-train", "source": "NS timetable", "updatedAt": "2026-11-13" },
+        { "city": "Utrecht", "distanceKm": 47, "publicTransportMinutes": 29, "mode": "direct-train", "source": "NS timetable", "updatedAt": "2026-11-13" },
+        { "city": "Nijmegen", "distanceKm": 42, "publicTransportMinutes": 37, "mode": "direct-train", "source": "NS timetable", "updatedAt": "2026-11-13" },
+        { "city": "Breda", "distanceKm": 40, "publicTransportMinutes": 42, "mode": "direct-train", "source": "NS timetable", "updatedAt": "2026-11-13" },
+        { "city": "Amsterdam", "distanceKm": 81, "publicTransportMinutes": 56, "mode": "direct-train", "source": "NS route guide", "updatedAt": "2026-11-13" },
+        { "city": "Rotterdam", "distanceKm": 73, "publicTransportMinutes": 62, "mode": "train-transfer", "source": "Typical NS journey", "updatedAt": "2026-11-13" },
+        { "city": "Den Haag", "aliases": ["The Hague"], "distanceKm": 82, "publicTransportMinutes": 68, "mode": "direct-train", "source": "Typical NS journey", "updatedAt": "2026-11-13" },
+        { "city": "Delft", "distanceKm": 75, "publicTransportMinutes": 70, "mode": "train-transfer", "source": "Typical NS journey", "updatedAt": "2026-11-13" },
+        { "city": "Arnhem", "distanceKm": 52, "publicTransportMinutes": 50, "mode": "train-transfer", "source": "Typical NS journey", "updatedAt": "2026-11-13" },
+        { "city": "Amersfoort", "distanceKm": 52, "publicTransportMinutes": 49, "mode": "train-transfer", "source": "Typical NS journey", "updatedAt": "2026-11-13" },
+        { "city": "Apeldoorn", "distanceKm": 68, "publicTransportMinutes": 65, "mode": "train-transfer", "source": "Typical NS journey", "updatedAt": "2026-11-13" },
+        { "city": "Leiden", "distanceKm": 82, "publicTransportMinutes": 73, "mode": "train-transfer", "source": "Typical NS journey", "updatedAt": "2026-11-13" },
+        { "city": "Haarlem", "distanceKm": 89, "publicTransportMinutes": 72, "mode": "train-transfer", "source": "Typical NS journey", "updatedAt": "2026-11-13" },
+        { "city": "Zwolle", "distanceKm": 87, "publicTransportMinutes": 73, "mode": "direct-train", "source": "Typical NS journey", "updatedAt": "2026-11-13" },
+        { "city": "Groningen", "distanceKm": 176, "publicTransportMinutes": 140, "mode": "train-transfer", "source": "Typical NS journey", "updatedAt": "2026-11-13" },
+        { "city": "Maastricht", "distanceKm": 128, "publicTransportMinutes": 88, "mode": "direct-train", "source": "Typical NS journey", "updatedAt": "2026-11-13" }
+      ]
+    }
   },
   "preferredWorkArrangements": [
     "hybrid",

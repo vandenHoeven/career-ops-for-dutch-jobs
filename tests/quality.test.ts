@@ -5,24 +5,26 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { enrichJob } from "../src/enrichment.js";
 import { profileFingerprint, scoreJob } from "../src/scoring.js";
+import { evaluateJob } from "../src/core.js";
 import { validateAiAssessment } from "../src/ai-scoring.js";
 import { Store } from "../src/database.js";
 import type { JobPosting, ProfileConfig } from "../src/types.js";
 
-const profile: ProfileConfig = { country: "Netherlands", countryAliases: ["netherlands", "amsterdam"], remoteAliases: [], roleFamilies: { research: ["researcher"] }, excludeTitleTerms: ["intern"], expiryAfterMissedScans: 3, technicalEvidenceTerms: { research: ["python", "statistics"] }, preferredRoleFamilies: ["research"], skills: [{ term: "python", weight: 5 }], desiredSeniority: ["mid"], preferredLocations: ["amsterdam"], preferredWorkArrangements: ["hybrid"], dealBreakers: ["unpaid"] };
+const profile: ProfileConfig = { country: "Netherlands", countryAliases: ["netherlands", "amsterdam"], remoteAliases: [], roleFamilies: { research: ["researcher"] }, excludeTitleTerms: ["intern"], expiryAfterMissedScans: 3, technicalEvidenceTerms: { research: ["python", "statistics"] }, preferredRoleFamilies: ["research"], skills: [{ term: "python", weight: 5 }], desiredSeniority: ["mid"], preferredLocations: ["amsterdam"], locationPenalties: { amsterdam: 10 }, preferredWorkArrangements: ["hybrid"], dealBreakers: ["unpaid"] };
 const base: any = { company: "Acme", title: "Researcher", location: "Amsterdam", description: "Use Python and statistics to build models", url: "https://example.com/job", roleFamily: "research", workArrangement: "hybrid", raw: {} };
 
 test("rules scoring is deterministic, explainable and enforces hard exclusions", () => {
   const first = scoreJob(base, profile), second = scoreJob(base, profile);
   assert.equal(first.score, second.score); assert.ok(first.score > 60); assert.deepEqual(first.breakdown.matchedSkills, ["python"]);
+  const penalties=first.ledger.components.find(component=>component.key==="penalties");assert.equal(penalties?.awarded,-10);assert.match(penalties?.explanation??"",/Location penalty: −10 for amsterdam/);assert.equal(evaluateJob(base,profile).matchState,"strong","location ranking penalties do not redefine strong-match eligibility");
   assert.equal(scoreJob({ ...base, title: "Research Intern" }, profile).rejected, "Excluded title term: intern");
   assert.equal(scoreJob({ ...base, title: "AI Engineering Manager" }, { ...profile, excludedSeniority: ["senior"] }).rejected, "Excluded seniority: senior");
   assert.equal(profileFingerprint(profile), profileFingerprint({ ...profile }));
 });
 
-test("scoring v4 preserves unknown date evidence and exposes exact arithmetic", () => {
+test("scoring v5 preserves unknown date evidence and exposes exact arithmetic", () => {
   const result = scoreJob({ ...base, postedAt: undefined }, profile);
-  assert.equal(result.ledger.version, "4");
+  assert.equal(result.ledger.version, "5");
   assert.equal(result.ledger.components.reduce((sum, component) => sum + Math.max(0, component.maximum), 0), 100);
   const freshness = result.ledger.components.find(component => component.key === "freshness");
   assert.equal(freshness?.awarded, 4);

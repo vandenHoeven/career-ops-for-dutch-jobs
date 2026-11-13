@@ -17,10 +17,10 @@ test('pending enrichment stores a description match once and marks its queue rec
 
 const profile: ProfileConfig = { country: "Netherlands", countryAliases: ["netherlands", "nederland", "nl", "amsterdam"], remoteAliases: ["remote netherlands"], roleFamilies: {}, excludeTitleTerms: [], expiryAfterMissedScans: 3 };
 
-test('missing descriptions are capped at 100 pages and overflow survives restart', async () => {
+test('missing descriptions are queued without blocking discovery and survive restart', async () => {
   const dir=mkdtempSync(join(tmpdir(),'diego-budget-')),path=join(dir,'test.sqlite');let store=new Store(path),requests=0;
   const source:DiscoverySource={id:'budget',label:'Budget',license:'fixture',kind:'job-feed',async discover(){return{nextCursor:0,total:1,candidates:[{sourceId:'budget',company:'Fixture Employer',provider:'recruitee',jobs:Array.from({length:101},(_,i)=>({company:'Fixture Employer',title:`Insights Analyst ${i}`,location:'Utrecht, Netherlands',url:`https://fixture.example/jobs/${i}`,raw:{}}))}]}}};
-  try {const result=await discover({store,sources:[source],limit:1,context:{fetchJson:async()=>({}),fetchText:async()=>{requests++;return `<main>${'Predictive modelling with statistics and machine learning. '.repeat(5)}</main>`;}}});assert.equal(requests,100);assert.equal(result.deferredEnrichments,1);assert.equal(result.descriptionMatches,100);store.close();store=new Store(path);assert.equal(store.pendingEnrichments().length,1);}finally{store.close();rmSync(dir,{recursive:true,force:true});}
+  try {const result=await discover({store,sources:[source],limit:1,context:{fetchJson:async()=>({}),fetchText:async()=>{requests++;return `<main>${'Predictive modelling with statistics and machine learning. '.repeat(5)}</main>`;}}});assert.equal(requests,0);assert.equal(result.deferredEnrichments,101);assert.equal(result.descriptionMatches,0);store.close();store=new Store(path);assert.equal(store.pendingEnrichmentCount(),101);}finally{store.close();rmSync(dir,{recursive:true,force:true});}
 });
 
 test('source-loading errors cannot produce a successful zero-coverage run',async()=>{

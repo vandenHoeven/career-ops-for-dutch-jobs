@@ -10,7 +10,7 @@ import {
   useParams,
 } from "react-router-dom";
 import LegacyApp from "./App";
-import { api, date } from "./api";
+import { api, ApiError, date } from "./api";
 import "./dense.css";
 import "./action-column.css";
 import LocationSettings from "./LocationSettings";
@@ -129,6 +129,8 @@ const Score = ({ job }: { job: Job }) => (
     {job.hard_excluded ? "Excluded" : (job.overall_score ?? "—")}
   </span>
 );
+const accessMode=(value?:string)=>value==='direct-train'?'direct train':value==='train-transfer'?'train + transfer':value==='bus'?'bus':'car-oriented';
+const accessLabel=(job:Job)=>{const access=job.locationAccess;if(!access)return 'Unknown';const details=[access.tier[0].toUpperCase()+access.tier.slice(1)];if(access.mode)details.push(accessMode(access.mode));if(access.publicTransportMinutes!==undefined)details.push(`~${access.publicTransportMinutes} min`);return details.join(' · ')};
 
 function JobTable({
   items,
@@ -177,6 +179,7 @@ function JobTable({
             {!compact && (
               <>
                 <th>Posted</th>
+                <th>First seen</th>
               </>
             )}
             <th>Source</th>
@@ -204,6 +207,7 @@ function JobTable({
               <td>
                 {job.location || "Location unconfirmed"}
                 <small>{job.work_arrangement || "unknown mode"}</small>
+                <span className={`access-badge ${job.location_access_tier??'unknown'}`} title={job.locationAccess?.explanation}>{accessLabel(job)}</span>
               </td>
               {!compact && (
                 <>
@@ -214,6 +218,10 @@ function JobTable({
                         ? job.posted_date_precision
                         : "Provider did not supply"}
                     </small>
+                  </td>
+                  <td>
+                    <DateCell value={job.first_seen_at} />
+                    <small>Added to Career Ops</small>
                   </td>
                 </>
               )}
@@ -253,7 +261,7 @@ function JobTable({
 
 function Jobs() {
   const location=useLocation(),navigate=useNavigate(),params=new URLSearchParams(location.search),
-    q=params.get("q")??"",matchState=params.get("matchState")??"",role=params.get("roleFamily")??"",provider=params.get("provider")??"",work=params.get("workArrangement")??"",locationGroup=params.get("locationGroup")??"",sort=params.get("sort")??"score",view=params.get("view")??"new",reviewStates=(params.get("reviewState")??"").split(",").filter(Boolean),applicationStages=(params.get("applicationStage")??"").split(",").filter(Boolean),size=params.get("size")??"50",page=Number(params.get("page")??0);
+    q=params.get("q")??"",matchState=params.get("matchState")??"",role=params.get("roleFamily")??"",provider=params.get("provider")??"",work=params.get("workArrangement")??"",locationAccess=params.get("locationAccess")??"",sort=params.get("sort")??"score",view=params.get("view")??"new",reviewStates=(params.get("reviewState")??"").split(",").filter(Boolean),applicationStages=(params.get("applicationStage")??"").split(",").filter(Boolean),size=params.get("size")??"50",page=Number(params.get("page")??0);
   const [selected,setSelected]=useState<Set<string>>(()=>new Set(JSON.parse(sessionStorage.getItem("jobs:selected")??"[]"))),[loaded,setLoaded]=useState(Number(sessionStorage.getItem("jobs:loaded")??50));
   const update=(values:Record<string,string>,keepPage=false)=>{const next=new URLSearchParams(location.search);Object.entries(values).forEach(([key,value])=>value?next.set(key,value):next.delete(key));if(!keepPage)next.delete("page");setSelected(new Set());setLoaded(50);navigate(`/jobs?${next}`)};
   const viewDefaults:Record<string,Record<string,string>>={new:{reviewState:"new",applicationStage:"",status:"active"},saved:{reviewState:"",applicationStage:"saved,preparing",status:""},submitted:{reviewState:"",applicationStage:"applied,screening,interview,assessment,offer",status:""},declined:{reviewState:"declined",applicationStage:"",status:""},active:{reviewState:"new,reviewed",applicationStage:"",status:"active"},expired:{reviewState:"",applicationStage:"",status:"expired"}};
@@ -276,7 +284,7 @@ function Jobs() {
       }
     >
       <div className="quick-views">{Object.entries({new:"New matches",saved:"Saved / preparing",submitted:"Submitted",declined:"Declined",active:"Active",expired:"Expired"}).map(([key,label])=><button className={view===key?"active":""} key={key} onClick={()=>chooseView(key)}>{label}</button>)}</div>
-      <div className="location-focus" aria-label="Location focus"><span>Location</span><button className={!locationGroup?"active":""} onClick={()=>update({locationGroup:""})}>All</button><button className={locationGroup==="amsterdam"?"active":""} onClick={()=>update({locationGroup:"amsterdam"})}>Amsterdam only</button><button className={locationGroup==="outside-amsterdam"?"active":""} onClick={()=>update({locationGroup:"outside-amsterdam"})}>Outside Amsterdam</button></div>
+      <div className="location-focus" aria-label="Location accessibility"><span>From Den Bosch</span>{[['','All'],['easy','Easy'],['medium','Medium'],['hard','Hard'],['remote','Remote'],['unknown','Unknown']].map(([value,label])=><button key={label} className={locationAccess===value?"active":""} onClick={()=>update({locationAccess:value})}>{label}</button>)}</div>
       <div className="jobs-toolbar filter-grid">
         <input
           aria-label="Search"
@@ -739,7 +747,7 @@ function RunList({ runs }: { runs: any[] }) {
                 {run.display_status || run.status}
               </span>
               <span>{run.processed_count} / {run.queued_count} queued · {run.mode??"balanced"}</span>
-              <span>{run.new_jobs} new jobs</span>
+              <span>{run.time_budget_ms?`${run.time_budget_ms/60000} minutes · ${run.new_strong_count??0} new strong · ${run.useful_match_count??0} reward-eligible · ${Number(run.weighted_reward??0).toFixed(1)} reward`:`${run.new_jobs} new jobs`}</span>
               <span>{run.error_count} errors</span>
               <time>{date(run.started_at)}</time>
             </summary>
@@ -752,7 +760,7 @@ function RunList({ runs }: { runs: any[] }) {
                   : "No issues recorded."}
               </p>
               <dl>
-                <dt>Requested budget</dt><dd>{run.limit_count}</dd>
+                {run.time_budget_ms?<><dt>Processing time</dt><dd>{run.time_budget_ms/60000} minutes</dd><dt>Weighted reward</dt><dd>{Number(run.weighted_reward??0).toFixed(1)}</dd></>:<><dt>Requested budget</dt><dd>{run.limit_count}</dd></>}
                 <dt>Eligible queued</dt><dd>{run.queued_count}</dd>
                 <dt>Unfilled</dt><dd>{run.unfilled_count??0}</dd>
                 <dt>Duplicates merged</dt><dd>{run.duplicate_candidate_count??0}</dd>
@@ -774,7 +782,7 @@ function RunList({ runs }: { runs: any[] }) {
                 <dt>Description-derived matches</dt><dd>{run.description_match_count ?? 0}</dd>
                 <dt>Enrichment failures</dt><dd>{run.enrichment_failure_count ?? 0}</dd>
               </dl>
-              {run.plan ? <SourceBreakdown sources={run.sources ?? []} /> : <p className="legacy-plan">Legacy allocation unavailable.</p>}
+              {run.time_budget_ms?<AdaptiveRunSources runId={run.id}/>:run.plan ? <SourceBreakdown sources={run.sources ?? []} /> : <p className="legacy-plan">Legacy allocation unavailable.</p>}
               <HistoricalTrace runId={run.id}/>
             </div>
           </details>
@@ -783,12 +791,20 @@ function RunList({ runs }: { runs: any[] }) {
     </section>
   );
 }
+function AdaptiveRunSources({runId}:{runId:string}){
+ const detail=useData<any>(`/api/v1/discovery/runs/${runId}`);if(detail.loading)return <Loading/>;if(detail.error)return <p className="error">{detail.error}</p>;
+ return <div className="source-progress-wrap"><table className="source-progress adaptive-source-history"><thead><tr><th>Source</th><th>Searches</th><th>Returned</th><th>Unique queued</th><th>True duplicates</th><th>Acquisition</th><th>Processed</th><th>Jobs</th><th>New strong</th><th>Reward-eligible</th><th>Reward</th></tr></thead><tbody>{(detail.data?.sources??[]).map((row:any)=><tr key={row.source_id}><td><strong>{row.source_id}</strong><small>{row.label}</small></td><td>{row.pulls}</td><td>{row.returned_count}</td><td>{row.queued_count}</td><td>{row.duplicate_count}</td><td>{duration(row.acquisition_ms??0)}</td><td>{row.processed_candidates}</td><td>{row.jobs_fetched}</td><td>{row.new_strong_count}</td><td>{row.useful_match_count}</td><td>{Number(row.weighted_reward??0).toFixed(1)}</td></tr>)}</tbody></table>{Number(detail.data?.metrics_version??1)<2&&<p className="forecast-warning">Legacy adaptive metrics: duplicate counts may include queue-position collisions.</p>}</div>;
+}
 const categoryLabels:Record<string,string>={linkedin:"LinkedIn Guest",jobspy:"JobSpy",priority:"Known & benchmark boards",native:"Native Dutch feeds",directories:"Global ATS directories"};
+const discoveryCategories=["linkedin","jobspy","priority","native","directories"] as const;
+type AllocationWeights=Record<(typeof discoveryCategories)[number],number>;
+const normalizeAllocationWeights=(values:Record<string,number>):AllocationWeights=>{const total=discoveryCategories.reduce((sum,key)=>sum+Math.max(0,Number(values[key]??0)),0)||1;return Object.fromEntries(discoveryCategories.map(key=>[key,Math.max(0,Number(values[key]??0))/total])) as AllocationWeights};
+const scaleAllocations=(limit:number,weights:AllocationWeights):Record<string,number>=>{const raw=discoveryCategories.map(key=>limit*weights[key]),base=raw.map(Math.floor),remaining=limit-base.reduce((sum,value)=>sum+value,0),ranked=discoveryCategories.map((_,index)=>index).sort((a,b)=>(raw[b]-base[b])-(raw[a]-base[a])||a-b);for(let index=0;index<remaining;index++)base[ranked[index]]++;return Object.fromEntries(discoveryCategories.map((key,index)=>[key,base[index]]))};
 const expectedLabel=(value:number)=>value>0&&value<1?"<1":String(Math.round(value));
 const duration=(ms:number)=>ms<1000?`${Math.max(0,Math.round(ms))} ms`:ms<60000?`${Math.round(ms/100)/10} sec`:`${Math.round(ms/6000)/10} min`;
 const etaLabel=(eta:any)=>eta?.seconds===null||eta?.seconds===undefined?"Estimating…":eta.seconds<60?"Less than a minute remaining":`About ${Math.max(1,Math.round(eta.seconds/60))} min remaining`;
 function SourceBreakdown({sources}:{sources:any[]}){
- return <div className="source-progress-wrap"><table className="source-progress"><thead><tr><th>Source / active stage</th><th>Allocated</th><th>Queried</th><th>Returned</th><th>Skipped recent</th><th>Duplicates</th><th>Queued</th><th>Fresh</th><th>Recheck</th><th>Continued</th><th>Forced</th><th>Active</th><th>Processed</th><th>Fetched</th><th>Dutch</th><th>Matches</th><th>Avg.</th><th>Errors</th></tr></thead><tbody>{sources.map(row=><tr key={row.source_id??row.id} className={(row.planned_count??row.planned??0)===0?"excluded-source":""}><td><Link to={`/sources/${encodeURIComponent(row.source_id??row.id)}`}>{row.label??row.source_id??row.id}</Link><small>{(row.planned_count??row.planned??0)===0?"Excluded by allocation":row.active_stages||row.category}{row.current_cursor?` · cursor ${row.current_cursor}`:""}</small></td><td>{row.planned_count??row.planned??0}{row.reassigned_count?` +${row.reassigned_count} within selection`:""}</td><td>{row.requested_count??0}</td><td>{row.returned_count??0}</td><td>{row.skipped_recent_count??0}</td><td>{row.duplicate_count??0}</td><td>{row.queued_count??0}</td><td>{row.fresh_count??0}</td><td>{row.recheck_count??0}</td><td>{row.continuation_count??0}</td><td>{row.forced_refresh_count??0}</td><td>{row.active_workers??0}</td><td>{row.processed_count??0}</td><td>{row.jobs_fetched??0}</td><td>{row.netherlands_jobs??0}</td><td>{row.profile_matches??0}</td><td>{row.avg_duration_ms?duration(row.avg_duration_ms):"—"}</td><td>{row.errors??0}</td></tr>)}</tbody></table></div>;
+ return <div className="source-progress-wrap"><table className="source-progress"><thead><tr><th>Source / active stage</th><th>Allocated</th><th>Queried</th><th>Returned</th><th>Skipped recent</th><th>Duplicates</th><th>Queued</th><th>Fresh</th><th>Recheck</th><th>Continued</th><th>Forced</th><th>Active</th><th>Processed</th><th>Fetched</th><th>Dutch</th><th>Matches</th><th>Avg.</th><th>Errors</th></tr></thead><tbody>{sources.map(row=><tr key={row.source_id??row.id} className={(row.planned_count??row.planned??0)===0&&row.tier!=="fallback"?"excluded-source":""}><td><Link to={`/sources/${encodeURIComponent(row.source_id??row.id)}`}>{row.label??row.source_id??row.id}</Link><small>{row.tier==="fallback"?"Turbo fallback":row.tier==="excluded"?"Excluded by Turbo":(row.planned_count??row.planned??0)===0?"Excluded by allocation":row.active_stages||row.category}{row.current_cursor?` · cursor ${row.current_cursor}`:""}</small></td><td>{row.planned_count??row.planned??0}{row.reassigned_count?` +${row.reassigned_count} within selection`:""}</td><td>{row.requested_count??0}</td><td>{row.returned_count??0}</td><td>{row.skipped_recent_count??0}</td><td>{row.duplicate_count??0}</td><td>{row.queued_count??0}</td><td>{row.fresh_count??0}</td><td>{row.recheck_count??0}</td><td>{row.continuation_count??0}</td><td>{row.forced_refresh_count??0}</td><td>{row.active_workers??0}</td><td>{row.processed_count??0}</td><td>{row.jobs_fetched??0}</td><td>{row.netherlands_jobs??0}</td><td>{row.profile_matches??0}</td><td>{row.avg_duration_ms?duration(row.avg_duration_ms):"—"}</td><td>{row.errors??0}</td></tr>)}</tbody></table></div>;
 }
 function TechnicalTrace({runId}:{runId:string}){
  const [events,setEvents]=useState<any[]>([]),[dropped,setDropped]=useState(0);
@@ -796,15 +812,37 @@ function TechnicalTrace({runId}:{runId:string}){
  return <details className="technical-trace"><summary>Technical trace <span>{events.length} visible{dropped?` · ${dropped} older events dropped`:""}</span></summary><div className="trace-list">{events.map(event=><article key={event.sequence} className={event.level}><time>{new Date(event.occurred_at).toLocaleTimeString()}</time><strong>{event.event_type}</strong><span>{event.source_id||event.phase}{event.worker_id?` · ${event.worker_id}`:""}</span><p>{event.message}</p>{event.url&&<a href={event.url} target="_blank" rel="noreferrer">{event.url}</a>}<small>{[event.http_status&&`HTTP ${event.http_status}`,event.attempt&&`attempt ${event.attempt}`,event.cursor&&`cursor ${event.cursor}`,event.duration_ms!==null&&event.duration_ms!==undefined&&duration(event.duration_ms)].filter(Boolean).join(" · ")}</small></article>)}</div>{!events.length&&<p className="trace-empty">Waiting for trace events…</p>}</details>;
 }
 function HistoricalTrace({runId}:{runId:string}){const [open,setOpen]=useState(false);return <div className="historical-trace"><button onClick={()=>setOpen(value=>!value)}>{open?"Hide technical trace":"Load technical trace"}</button>{open&&<TechnicalTrace runId={runId}/>}</div>}
-function Discovery() {
-  const history = useData<any>("/api/v1/discovery/runs"),
+function ForecastCurve({curve,currentLimit,disabled,onSelect}:{curve:any;currentLimit:number;disabled:boolean;onSelect:(limit:number)=>void}){
+ const points=(curve?.points??[]) as Array<{limit:number;ml:{point:number;lower:number;upper:number};baseline:{point:number}}>,selectedIndex=Math.max(0,points.findIndex(point=>point.limit===currentLimit)),[focusIndex,setFocusIndex]=useState(selectedIndex);
+ useEffect(()=>setFocusIndex(selectedIndex),[selectedIndex]);
+ if(points.length<2)return null;
+ const width=760,height=270,left=54,right=18,top=28,bottom=48,plotWidth=width-left-right,plotHeight=height-top-bottom,min=Number(curve.minLimit??points[0].limit),max=Number(curve.maxLimit??points.at(-1)!.limit),yMax=Math.max(1,...points.flatMap(point=>[point.ml.upper,point.ml.point,point.baseline.point]))*1.08,x=(value:number)=>left+(value-min)/Math.max(1,max-min)*plotWidth,y=(value:number)=>top+plotHeight-Math.max(0,value)/yMax*plotHeight,line=(values:number[])=>values.map((value,index)=>`${index?"L":"M"}${x(points[index].limit).toFixed(1)},${y(value).toFixed(1)}`).join(" "),band=[...points.map(point=>`${x(point.limit).toFixed(1)},${y(point.ml.upper).toFixed(1)}`),...points.slice().reverse().map(point=>`${x(point.limit).toFixed(1)},${y(point.ml.lower).toFixed(1)}`)].join(" "),active=points[Math.min(focusIndex,points.length-1)],supportMax=Number(curve.historicalSupport?.maxLimit??0),tickLimits=[min,min+(max-min)*.25,min+(max-min)*.5,min+(max-min)*.75,max],yTicks=[0,yMax/2,yMax];
+ const choose=(index:number)=>{setFocusIndex(index);onSelect(points[index].limit)};
+ return <section className="forecast-curve" aria-labelledby="forecast-curve-title">
+  <div className="forecast-curve-head"><div><span>Budget explorer</span><strong id="forecast-curve-title">Candidate budget vs. new strong matches</strong></div><p><b>{active.limit} candidates</b> &rarr; ML ~{expectedLabel(active.ml.point)} <small>(95% {expectedLabel(active.ml.lower)}&ndash;{expectedLabel(active.ml.upper)})</small> &middot; baseline ~{expectedLabel(active.baseline.point)}</p></div>
+  <div className="forecast-chart-wrap"><svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Candidate budget forecast curve">
+   {yTicks.map(value=><g key={value}><line className="forecast-grid" x1={left} x2={width-right} y1={y(value)} y2={y(value)}/><text className="forecast-axis-label" x={left-8} y={y(value)+4} textAnchor="end">{expectedLabel(value)}</text></g>)}
+   {tickLimits.map(value=><text className="forecast-axis-label" key={value} x={x(value)} y={height-22} textAnchor="middle">{Math.round(value)}</text>)}
+   <text className="forecast-axis-title" x={left+plotWidth/2} y={height-4} textAnchor="middle">Candidate budget</text><text className="forecast-axis-title" transform={`translate(13 ${top+plotHeight/2}) rotate(-90)`} textAnchor="middle">Estimated strong matches</text>
+   {supportMax>=min&&supportMax<max&&<line className="forecast-support-line" x1={x(supportMax)} x2={x(supportMax)} y1={top} y2={top+plotHeight}/>}<polygon className="forecast-band" points={band}/><path className="forecast-baseline-line" d={line(points.map(point=>point.baseline.point))}/><path className="forecast-ml-line" d={line(points.map(point=>point.ml.point))}/><line className="forecast-current-line" x1={x(currentLimit)} x2={x(currentLimit)} y1={top} y2={top+plotHeight}/>
+   {points.map((point,index)=><circle key={point.limit} className={`forecast-point ${index===focusIndex?"active":""}`} cx={x(point.limit)} cy={y(point.ml.point)} r={index===focusIndex?6:4} role="button" tabIndex={disabled?-1:0} aria-label={`${point.limit} candidates, about ${expectedLabel(point.ml.point)} new strong matches, 95 percent range ${expectedLabel(point.ml.lower)} to ${expectedLabel(point.ml.upper)}`} onMouseEnter={()=>setFocusIndex(index)} onFocus={()=>setFocusIndex(index)} onClick={()=>!disabled&&choose(index)} onKeyDown={event=>{if(!disabled&&(event.key==="Enter"||event.key===" ")){event.preventDefault();choose(index)}}}><title>{point.limit} candidates: ML ~{expectedLabel(point.ml.point)}, range {expectedLabel(point.ml.lower)}&ndash;{expectedLabel(point.ml.upper)}, baseline ~{expectedLabel(point.baseline.point)}</title></circle>)}
+  </svg></div>
+  <div className="forecast-legend"><span className="ml">ML estimate</span><span className="range">95% likely range</span><span className="baseline">Recent-history baseline</span></div>
+  <label className="forecast-slider">Choose a plotted budget<input aria-label="Choose candidate budget from forecast curve" type="range" min={0} max={points.length-1} step={1} value={Math.min(focusIndex,points.length-1)} disabled={disabled} onChange={event=>choose(Number(event.target.value))}/><output>{active.limit}</output></label>
+  {supportMax>0&&supportMax<max&&<p className="forecast-extrapolation">Budgets above {supportMax} exceed the largest completed historical run and are model extrapolations.</p>}
+ </section>
+}
+function LegacyDiscovery() {
+  const navigate=useNavigate(),history = useData<any>("/api/v1/discovery/runs"),
     coverage = useData<any>("/api/v1/coverage"),
-    [limit, setLimit] = useState(100),[workers,setWorkers]=useState(6),
-    plan=useData<any>(`/api/v1/discovery/plan?limit=${limit}`),
+    [limit, setLimit] = useState(100),[workers,setWorkers]=useState(6),[mode,setMode]=useState<"balanced"|"fresh"|"refresh-known"|"turbo">("balanced"),
+    plan=useData<any>(`/api/v1/discovery/plan?limit=${limit}&mode=${mode}`),
     activeCheck=useData<any>("/api/v1/discovery/active"),
-    [allocations,setAllocations]=useState<Record<string,number>>(),[mode,setMode]=useState<"balanced"|"fresh"|"refresh-known">("balanced"),
+    enrichment=useData<any>("/api/v1/enrichment/queue"),
+    [allocations,setAllocations]=useState<Record<string,number>>(),[allocationWeights,setAllocationWeights]=useState<AllocationWeights>(),
     [forecast,setForecast]=useState<{data?:any;loading:boolean;error?:string}>({loading:false}),
-    [active, setActive] = useState<string>(),[startError,setStartError]=useState<string>();
+    [active, setActive] = useState<string>(),[startError,setStartError]=useState<string>(),[enrichmentStarting,setEnrichmentStarting]=useState(false),[enrichmentMessage,setEnrichmentMessage]=useState<string>(),
+    [manualUrl,setManualUrl]=useState(""),[manualLoading,setManualLoading]=useState(false),[manualError,setManualError]=useState<string>(),[manualResult,setManualResult]=useState<any>();
   const run = useData<any>(
     active ? `/api/v1/discovery/runs/${active}` : "/api/v1/discovery/runs/none",
   );
@@ -824,32 +862,48 @@ function Discovery() {
     }
     return () => clearInterval(timer);
   }, [active, run.data?.status]);
-  useEffect(()=>{if(plan.data?.allocations)setAllocations(plan.data.allocations)},[plan.data?.limit]);
+  useEffect(()=>{if(plan.data?.allocations&&!allocations){setAllocations(plan.data.allocations);setAllocationWeights(normalizeAllocationWeights(plan.data.allocations))}},[plan.data?.allocations,allocations]);
   useEffect(()=>{if(activeCheck.data?.id)setActive(activeCheck.data.id)},[activeCheck.data?.id]);
+  useEffect(()=>{const timer=setInterval(enrichment.reload,5000);return()=>clearInterval(timer)},[]);
   const allocationTotal=Object.values(allocations??{}).reduce((sum,value)=>sum+Number(value||0),0),validAllocation=allocationTotal===limit&&Object.values(allocations??{}).every(value=>Number.isInteger(value)&&value>=0);
   const allocationKey=JSON.stringify(allocations??{});
+  const weightKey=JSON.stringify(allocationWeights??{});
   const includedCategories=Object.entries(allocations??{}).filter(([,value])=>Number(value)>0).map(([key])=>categoryLabels[key]??key),excludedCategories=Object.entries(allocations??{}).filter(([,value])=>Number(value)===0).map(([key])=>categoryLabels[key]??key);
+  const applyBudget=(requested:number)=>{const next=Math.min(5000,Math.max(1,Math.round(requested||1)));if(allocationWeights)setAllocations(scaleAllocations(next,allocationWeights));setLimit(next)};
+  const changeAllocation=(category:string,value:number)=>{const next={...(allocations??{}),[category]:value};setAllocations(next);const total=Object.values(next).reduce((sum,count)=>sum+Number(count||0),0);if(total===limit&&Object.values(next).every(count=>Number.isInteger(count)&&count>=0))setAllocationWeights(normalizeAllocationWeights(next))};
   useEffect(()=>{
-    if(mode==="refresh-known"){setForecast({loading:false});return;}
-    if(!validAllocation||!allocations){setForecast({loading:false});return;}
+    if(mode!=="refresh-known"&&mode!=="turbo"&&(!validAllocation||!allocations)){setForecast({loading:false});return;}
+    if(mode!=="turbo"&&!allocations){setForecast({loading:false});return;}
     const controller=new AbortController(),timer=setTimeout(()=>{
       setForecast(current=>({...current,loading:true,error:undefined}));
-      api<any>("/api/v1/discovery/forecast",{method:"POST",body:JSON.stringify({limit,allocations}),signal:controller.signal})
+      api<any>("/api/v1/discovery/forecast",{method:"POST",body:JSON.stringify(mode==="turbo"?{limit,mode}:{limit,allocations,allocationWeights,mode}),signal:controller.signal})
         .then(data=>setForecast({data,loading:false}))
         .catch(error=>{if(error?.name!=="AbortError")setForecast({loading:false,error:error instanceof Error?error.message:String(error)})});
     },300);
     return()=>{clearTimeout(timer);controller.abort()};
-  },[limit,allocationKey,validAllocation,mode]);
+  },[limit,allocationKey,weightKey,validAllocation,mode]);
   const start = async (resume = false) => {
     setStartError(undefined);
-    try{const result = await api<any>("/api/v1/discovery",{method:"POST",body:JSON.stringify(resume?{resume:true}:{limit,workers,mode,...(mode==="refresh-known"?{}:{allocations})})});setActive(result.id);}catch(error){setStartError(error instanceof Error?error.message:String(error));}
+    try{const result = await api<any>("/api/v1/discovery",{method:"POST",body:JSON.stringify(resume?{resume:true}:mode==="turbo"?{limit,mode}:{limit,workers,mode,...(mode==="refresh-known"?{}:{allocations})})});setActive(result.id);}catch(error){if(error instanceof ApiError&&error.status===409&&error.data?.activeRun?.id){setActive(error.data.activeRun.id);return;}setStartError(error instanceof Error?error.message:String(error));}
+  };
+  const runDueEnrichment=async()=>{
+    setEnrichmentStarting(true);setEnrichmentMessage(undefined);
+    try{const result=await api<any>("/api/v1/enrichment/queue/process",{method:"POST"});setEnrichmentMessage(result.status==="scheduled"?`Starting ${result.eligibleCount} due description${result.eligibleCount===1?"":"s"}.`:result.status==="running"?"Description enrichment is already running.":result.status==="waiting"?"Nothing is due yet; automatic retry remains scheduled.":"No description work is due.");await enrichment.reload();}
+    catch(error){setEnrichmentMessage(error instanceof Error?error.message:String(error));}
+    finally{setEnrichmentStarting(false)}
+  };
+  const addManual=async(event:React.FormEvent)=>{
+    event.preventDefault();setManualLoading(true);setManualError(undefined);setManualResult(undefined);
+    try{const result=await api<any>("/api/v1/discovery/manual",{method:"POST",body:JSON.stringify({url:manualUrl,saveToPipeline:true})});setManualResult(result);setManualUrl("");coverage.reload();history.reload();}
+    catch(error){setManualError(error instanceof Error?error.message:String(error));}
+    finally{setManualLoading(false)}
   };
   return (
     <Page
       eyebrow="Collection evidence"
       title="Discovery"
       actions={
-        <button className="primary" disabled={!!active||(mode!=="refresh-known"&&!validAllocation)} onClick={() => start()}>
+        <button className="primary" disabled={!!active||(mode!=="refresh-known"&&mode!=="turbo"&&!validAllocation)} onClick={() => start()}>
           Start discovery
         </button>
       }
@@ -873,28 +927,45 @@ function Discovery() {
           <strong>{coverage.data?.nonmatchingVacancies ?? "—"}</strong>
         </article>
       </div>
+      <div className={`enrichment-status ${enrichment.data?.runnerStatus?.state??"loading"}`} aria-live="polite">
+        <div className="enrichment-status-head"><span className="enrichment-live-dot" aria-hidden="true"/><div><strong>Description enrichment</strong><p>{enrichment.data?.runnerStatus?.state==="running"?"Actively collecting descriptions":enrichment.data?.runnerStatus?.state==="paused"?"Paused while discovery is active":enrichment.data?.runnerStatus?.state==="waiting"?"Waiting for the next retry window":enrichment.data?.runnerStatus?.state==="idle"?"Idle - no description work is due":"Checking status..."}</p></div><button onClick={runDueEnrichment} disabled={enrichmentStarting||enrichment.data?.runnerStatus?.state==="running"||enrichment.data?.runnerStatus?.state==="paused"||!(enrichment.data?.summary?.eligibleNow>0)}>{enrichmentStarting?"Starting...":"Run due now"}</button></div>
+        <div className="enrichment-metrics"><span><b>{enrichment.data?.summary?.eligibleNow??0}</b> ready</span><span><b>{enrichment.data?.summary?.coolingDown??0}</b> cooling down</span><span><b>{enrichment.data?.runnerStatus?.activeBatch??0}</b> in active batch</span><span><b>{enrichment.data?.summary?.terminal??0}</b> terminal</span></div>
+        <small>{enrichment.data?.summary?.nextRetryAt?`Next automatic retry ${new Date(enrichment.data.summary.nextRetryAt).toLocaleString("en-NL",{dateStyle:"medium",timeStyle:"short"})}. `:""}{enrichment.data?.runnerStatus?.lastResult?`Last batch: ${enrichment.data.runnerStatus.lastResult.processed} processed, ${enrichment.data.runnerStatus.lastResult.stored} stored, ${enrichment.data.runnerStatus.lastResult.failed} failed. `:""}Discovery saves jobs immediately and enrichment pauses while a run is active.</small>
+        {enrichmentMessage&&<p className="enrichment-message">{enrichmentMessage}</p>}
+      </div>
+      <section className="evidence-section manual-import">
+        <div className="section-heading"><div><p>One-off collection</p><h2>Add a vacancy by URL</h2></div><small>Imports, scores, and saves it to your pipeline.</small></div>
+        <form onSubmit={addManual}>
+          <input aria-label="Vacancy URL" type="url" required placeholder="https://employer.nl/vacatures/role" value={manualUrl} disabled={manualLoading} onChange={event=>setManualUrl(event.target.value)}/>
+          <button className="primary" disabled={manualLoading||!manualUrl.trim()}>{manualLoading?"Importing…":"Add & save"}</button>
+        </form>
+        {manualError&&<div className="error" role="alert">{manualError}</div>}
+        {manualResult&&<div className="manual-success"><div><strong>{manualResult.job.title}</strong><span>{manualResult.job.company} · {manualResult.job.location||"Location not listed"}</span><small>{manualResult.importStatus==="new"?"Added to Career Ops":"Existing record refreshed"} · saved to pipeline · {manualResult.matchState} match</small></div><button onClick={()=>navigate(`/jobs/${manualResult.jobId}`)}>Open tracked job</button></div>}
+      </section>
       <section className="evidence-section discovery-plan">
-       <div className="section-heading"><div><p>Before you run</p><h2>Run plan</h2></div><div className="run-controls"><label>Candidate budget <input type="number" value={limit} min={1} max={5000} disabled={!!active} onChange={e=>setLimit(Math.min(5000,Math.max(1,Number(e.target.value))))}/></label><label>Workers <select value={workers} disabled={!!active} onChange={e=>setWorkers(Number(e.target.value))}>{[1,2,3,4,5,6,7,8].map(value=><option key={value} value={value}>{value}{value===6?" · recommended":""}</option>)}</select><small>Up to {workers} candidates. Workday/Ashby: 1 per host; other hosts: 2.</small></label></div></div>
+       <div className="section-heading"><div><p>Before you run</p><h2>Run plan</h2></div><div className="run-controls"><label>Candidate budget <input type="number" value={limit} min={1} max={5000} disabled={!!active} onChange={e=>applyBudget(Number(e.target.value))}/></label><label>Workers <select value={mode==="turbo"?8:workers} disabled={!!active||mode==="turbo"} onChange={e=>setWorkers(Number(e.target.value))}>{[1,2,3,4,5,6,7,8].map(value=><option key={value} value={value}>{value}{value===6?" · recommended":""}{value===8&&mode==="turbo"?" · Turbo":""}</option>)}</select><small>{mode==="turbo"?"Turbo automatically uses 8 workers.":`Up to ${workers} candidates.`} Workday/Ashby: 1 per host; other hosts: 2.</small></label></div></div>
        <div className="run-mode-grid" role="radiogroup" aria-label="Discovery run mode">
         <label className={mode==="balanced"?"selected":""}><input type="radio" name="run-mode" checked={mode==="balanced"} disabled={!!active} onChange={()=>setMode("balanced")}/><strong>Balanced rotation</strong><span>Recommended · advance through sources and revisit work only when due.</span><details><summary>Same-day repeat behavior</summary><p>Diego continues source cursors, resumes unfinished boards, skips successful matches for 24 hours and other resolved candidates for 7 days. Live feeds can change, so runs are not expected to be identical.</p></details></label>
         <label className={mode==="fresh"?"selected":""}><input type="radio" name="run-mode" checked={mode==="fresh"} disabled={!!active} onChange={()=>setMode("fresh")}/><strong>Fresh candidates</strong><span>Only candidates Diego has never processed before.</span><details><summary>What counts as fresh?</summary><p>Source cursors continue forward and candidates with prior health history are skipped. A run can finish below its budget when sources cannot supply enough unseen candidates.</p></details></label>
         <label className={mode==="refresh-known"?"selected":""}><input type="radio" name="run-mode" checked={mode==="refresh-known"} disabled={!!active} onChange={()=>setMode("refresh-known")}/><strong>Refresh known</strong><span>Recheck stored employer and ATS boards immediately.</span><details><summary>What is refreshed?</summary><p>Known boards are ordered least-recently checked first and normal freshness windows are bypassed. Feed and directory allocations do not apply.</p></details></label>
+        <label className={mode==="turbo"?"selected":""}><input type="radio" name="run-mode" checked={mode==="turbo"} disabled={!!active} onChange={()=>setMode("turbo")}/><strong>Turbo</strong><span>Automatic fast-source mix · 8 workers · balanced recency.</span><details><summary>How Turbo chooses</summary><p>Fast reliable feeds run concurrently. Slower proven boards are queried only if the primary sources cannot fill the candidate budget.</p></details></label>
        </div>
        {plan.loading?<Loading/>:plan.error?<div className="error">{plan.error}</div>:<>
-        <div className="strict-selection-note"><strong>Strict source selection</strong><p>Only sources with a value above zero will run. If they cannot fill the budget, the run finishes early instead of querying excluded sources.</p>{mode!=="refresh-known"&&<div><span>Included: {includedCategories.join(", ")||"none"}</span><span>Excluded: {excludedCategories.join(", ")||"none"}</span></div>}</div>
+        <div className="strict-selection-note"><strong>{mode==="turbo"?"Turbo tiered selection":"Strict source selection"}</strong><p>{mode==="turbo"?"Primary feeds run first. Proven fallback boards are contacted only when the fast tier cannot fill the budget.":"Only sources with a value above zero will run. If they cannot fill the budget, the run finishes early instead of querying excluded sources."}</p>{mode!=="refresh-known"&&mode!=="turbo"&&<div><span>Included: {includedCategories.join(", ")||"none"}</span><span>Excluded: {excludedCategories.join(", ")||"none"}</span></div>}</div>
         <p className="plan-note">{plan.data?.rules?.candidateMeaning} {plan.data?.rules?.redistribution}</p>
         <div className="forecast-card" aria-live="polite">
-          {mode==="refresh-known"?<div className="forecast-state"><strong>Known-board refresh</strong><br/>The full budget is assigned to stored employer and ATS boards; allocation forecasting does not apply.</div>:forecast.loading?<div className="forecast-state">Estimating recent matches…</div>:forecast.error?<div className="forecast-state error">Forecast unavailable: {forecast.error}</div>:forecast.data?<>
-            <div className="forecast-main"><span>Expected from this run</span><strong>~{expectedLabel(forecast.data.expectedRecentMatches)} recent matches</strong><small>Jobs posted within the last {forecast.data.freshnessDays} days</small></div>
-            <div className="forecast-undated"><span>Potentially recent</span><strong>~{expectedLabel(forecast.data.expectedUndatedMatches)}</strong><small>New matches without a trustworthy posting date</small></div>
-            <div className="forecast-evidence"><span className={`confidence ${forecast.data.confidence}`}>{forecast.data.confidence} confidence</span><small>Based on {forecast.data.historicalRuns} comparable runs and {forecast.data.historicalCandidates} candidates.</small>{forecast.data.unmodelledCandidates>0&&<small>{forecast.data.unmodelledCandidates} allocated candidates lack enough history and are not estimated.</small>}</div>
-            <div className="forecast-categories">{forecast.data.categories.filter((row:any)=>row.allocated>0).map((row:any)=><span key={row.category}><b>{categoryLabels[row.category]??row.category}</b>{row.modelled?` ~${expectedLabel(row.expectedRecentMatches)} recent`:` insufficient history`}</span>)}</div>
-          </>:<div className="forecast-state">Choose a valid allocation to estimate this run.</div>}
+          {forecast.loading?<div className="forecast-state">Estimating new strong matches…</div>:forecast.error?<div className="forecast-state error">Forecast unavailable: {forecast.error}</div>:forecast.data?<>
+            <div className="forecast-main"><span>ML estimate · new strong matches</span><strong>~{expectedLabel(forecast.data.ml.point)}</strong><small>95% likely range {expectedLabel(forecast.data.ml.lower)}–{expectedLabel(forecast.data.ml.upper)}</small></div>
+            <div className="forecast-baseline"><span>Recent-history baseline</span><strong>~{expectedLabel(forecast.data.baseline.point)}</strong><small>95% likely range {expectedLabel(forecast.data.baseline.lower)}–{expectedLabel(forecast.data.baseline.upper)}</small></div>
+            <div className="forecast-evidence"><span className={`confidence ${forecast.data.reliability}`}>{forecast.data.reliability} evidence</span><small>{forecast.data.trainingRuns} historical runs · {forecast.data.trainingCandidates} candidates</small><small>{forecast.data.betterBacktest==="insufficient-data"?"Not enough walk-forward tests to compare models.":`${forecast.data.betterBacktest==="ml"?"ML":"Baseline"} has lower walk-forward error.`}</small></div>
+            {forecast.data.curve&&<ForecastCurve curve={forecast.data.curve} currentLimit={limit} disabled={!!active} onSelect={applyBudget}/>}
+            <div className="forecast-categories">{forecast.data.sources.map((row:any)=><span key={row.sourceId}><b>{row.label}</b>ML ~{expectedLabel(row.mlExpected)} · baseline ~{expectedLabel(row.baselineExpected)} · {row.evidence}</span>)}</div>
+            <details className="forecast-audit"><summary>How this estimate is calculated</summary><p><strong>Target:</strong> {forecast.data.targetDefinition}</p>{forecast.data.warnings?.map((warning:string)=><p className="forecast-warning" key={warning}>{warning}</p>)}<div className="forecast-formulas"><p><strong>ML:</strong> {forecast.data.calculation.model}</p><p><strong>Baseline:</strong> {forecast.data.calculation.baseline}</p><p><strong>Range:</strong> {forecast.data.calculation.interval}</p></div><div className="forecast-table-wrap"><table><thead><tr><th>Source</th><th>Planned</th><th>ML</th><th>Baseline</th><th>History</th><th>Yield / 100</th><th>Main factors</th></tr></thead><tbody>{forecast.data.sources.map((row:any)=><tr key={row.sourceId}><td>{row.label}<small>{categoryLabels[row.category]??row.category}</small></td><td>{row.planned}</td><td>{row.mlExpected}</td><td>{row.baselineExpected}</td><td>{row.historicalRuns} runs · {row.historicalCandidates} candidates</td><td>{row.yieldPer100}</td><td>{row.factors.map((factor:any)=>`${factor.label} ${factor.effect>=0?"+":""}${factor.effect}`).join(" · ")||"Category prior"}</td></tr>)}</tbody></table></div><div className="forecast-backtest"><strong>Walk-forward accuracy</strong><span>ML MAE {forecast.data.ml.metrics.mae??"—"} · baseline MAE {forecast.data.baseline.metrics.mae??"—"} · ML 95% coverage {forecast.data.ml.metrics.coverage95===null?"—":`${Math.round(forecast.data.ml.metrics.coverage95*100)}%`}</span>{forecast.data.history?.length>0&&<span>Recent simulated forecasts: {forecast.data.history.map((row:any)=>`${new Date(row.startedAt).toLocaleDateString()}: ${row.actual} actual / ${row.ml} ML / ${row.baseline} baseline`).join(" · ")}</span>}</div></details>
+          </>:<div className="forecast-state">{mode==="turbo"?"Preparing the automatic Turbo estimate…":"Choose a valid allocation to estimate this run."}</div>}
         </div>
-        <div className={`allocation-grid ${mode==="refresh-known"?"inactive":""}`}>{Object.entries(plan.data?.allocations??{}).map(([category]:any)=><label key={category} className={`allocation-card ${category}`}><span>{categoryLabels[category]??category}</span><input type="number" min={0} disabled={!!active||mode==="refresh-known"} value={allocations?.[category]??0} onChange={e=>setAllocations(current=>({...current,[category]:Number(e.target.value)}))}/><small>{plan.data.sources.filter((source:any)=>source.category===category&&source.enabled).map((source:any)=>source.label).join(" · ")||"No enabled source"}</small></label>)}</div>
-        <p className={validAllocation?"allocation-total valid":"allocation-total invalid"}>Allocated {allocationTotal} of {limit} candidates{validAllocation?"":" — totals must match before starting"}</p>
+        {mode==="turbo"?<div className="turbo-source-plan">{(["primary","fallback","excluded"] as const).map(tier=><section key={tier} className={`turbo-tier ${tier}`}><h3>{tier}</h3><p>{tier==="primary"?"Queried concurrently":tier==="fallback"?"Used only after fast feeds underfill":"Not used by Turbo"}</p>{plan.data.sources.filter((source:any)=>source.tier===tier).map((source:any)=><article key={source.id}><div><strong>{source.label}</strong><span>{source.planned?`${source.planned} candidates`:tier}</span></div><small>{source.turboReason} · {source.turboEvidence.attempts} attempts · {duration(source.turboEvidence.averageDurationMs)} average · {(source.turboEvidence.matchYield*100).toFixed(1)}% match yield · {(source.turboEvidence.failureRate*100).toFixed(1)}% failures</small></article>)}</section>)}</div>:<><div className={`allocation-grid ${mode==="refresh-known"?"inactive":""}`}>{Object.entries(plan.data?.allocations??{}).map(([category]:any)=><label key={category} className={`allocation-card ${category}`}><span>{categoryLabels[category]??category}</span><input type="number" min={0} disabled={!!active||mode==="refresh-known"} value={allocations?.[category]??0} onChange={e=>changeAllocation(category,Number(e.target.value))}/><small>{plan.data.sources.filter((source:any)=>source.category===category&&source.enabled).map((source:any)=>source.label).join(" · ")||"No enabled source"}</small></label>)}</div><p className={validAllocation?"allocation-total valid":"allocation-total invalid"}>Allocated {allocationTotal} of {limit} candidates{validAllocation?"":" — totals must match before starting"}</p></>}
         <div className="scope-grid"><details open><summary>LinkedIn search scope</summary><p><strong>{plan.data.scope?.linkedin.location}</strong> · {plan.data.scope?.linkedin.strategy}</p><div className="scope-terms">{plan.data.scope?.linkedin.terms.map((term:string)=><span key={term}>{term}</span>)}</div></details><details open><summary>JobSpy search scope</summary><p><strong>{plan.data.scope?.jobspy.platforms.join(", ")||"No enabled platform"}</strong> · {plan.data.scope?.jobspy.location} · v{plan.data.scope?.jobspy.version}</p><p><strong>Focused Netherlands searches</strong></p><div className="scope-terms">{plan.data.scope?.jobspy.queries.map((query:string)=><span key={query}>{query}</span>)}</div><p><strong>For each preferred city, search these roles:</strong></p><div className="scope-query">{plan.data.scope?.jobspy.broadQuery||"none"}</div><p>Locations: {plan.data.scope?.jobspy.preferredCities.join(", ")||"none"}{plan.data.scope?.jobspy.hoursOld?` · Last ${plan.data.scope.jobspy.hoursOld} hours`:""}</p></details></div>
-        <details className="configured-sources"><summary>Configured source status</summary>{plan.data.sources.map((source:any)=><div className="configured-source" key={source.id}><span className={`source-status ${source.status}`}/><strong>{source.label}</strong><small>{categoryLabels[source.category]} · {source.status}{source.lastError?` · ${source.lastError}`:""}{mode!="refresh-known"&&source.deprioritized?` · deprioritized: ${source.yieldEvidence.attempts} attempts, ${duration(source.yieldEvidence.averageDurationMs)} average, ${(source.yieldEvidence.matchYield*100).toFixed(1)}% match yield · ${source.originalPlanned} to ${source.planned} initial candidates`:""}</small></div>)}</details>
+        <details className="configured-sources"><summary>Configured source status</summary>{plan.data.sources.map((source:any)=><div className="configured-source" key={source.id}><span className={`source-status ${source.status}`}/><strong>{source.label}</strong><small>{categoryLabels[source.category]} · {source.status}{source.tier?` · ${source.tier}`:""}{source.lastError?` · ${source.lastError}`:""}{mode!="refresh-known"&&source.deprioritized?` · deprioritized: ${source.yieldEvidence.attempts} attempts, ${duration(source.yieldEvidence.averageDurationMs)} average, ${(source.yieldEvidence.matchYield*100).toFixed(1)}% match yield · ${source.originalPlanned} to ${source.planned} initial candidates`:""}</small></div>)}</details>
        </>}
        <div className="run-actions"><button disabled={!!active} onClick={() => start(true)}>Resume interrupted</button></div>
        {startError&&<div className="error">{startError}</div>}
@@ -913,8 +984,8 @@ function Discovery() {
             >
               Cancel safely
             </button>
-            <div className="run-composition"><span><b>{run.data?.candidates_returned_count??0}</b> returned by selected sources</span><span><b>{run.data?.queued_count??0}</b> eligible queued</span><span><b>{run.data?.unfilled_count??0}</b> unfilled</span><span><b>{run.data?.fresh_candidate_count??0}</b> fresh</span><span><b>{run.data?.recheck_candidate_count??0}</b> due rechecks</span><span><b>{run.data?.continuation_candidate_count??0}</b> continued</span><span><b>{run.data?.forced_refresh_count??0}</b> forced refresh</span><span><b>{run.data?.skipped_recent_count??0}</b> skipped as recent</span><span><b>{run.data?.duplicate_candidate_count??0}</b> duplicates merged</span><span><b>{run.data?.new_jobs??0}</b> new jobs</span><span><b>{run.data?.error_count??0}</b> errors</span></div>
-            {(run.data?.unfilled_count??0)>0&&<div className="shortfall-card"><strong>{run.data.unfilled_count} requested slots could not be filled</strong><p>Excluded sources will not run. The selected sources returned fewer eligible candidates than the requested budget.</p>{run.data?.shortfall?.map((item:any)=><span key={item.sourceId}><b>{item.label}</b>: {item.returned} returned → {item.skippedRecent} recent skipped → {item.duplicates} duplicates → {item.queued} queued</span>)}</div>}
+            <div className="run-composition"><span><b>{run.data?.candidates_returned_count??0}</b> returned by selected sources</span><span><b>{run.data?.queued_count??0}</b> eligible queued</span><span><b>{run.data?.unfilled_count??0}</b> unfilled</span><span><b>{run.data?.fresh_candidate_count??0}</b> fresh</span><span><b>{run.data?.recheck_candidate_count??0}</b> due rechecks</span><span><b>{run.data?.continuation_candidate_count??0}</b> continued</span><span><b>{run.data?.forced_refresh_count??0}</b> forced refresh</span><span><b>{run.data?.skipped_recent_count??0}</b> skipped as recent</span><span><b>{run.data?.duplicate_candidate_count??0}</b> duplicates merged</span><span><b>{run.data?.deferred_enrichment_count??0}</b> queued for enrichment</span><span><b>{run.data?.new_jobs??0}</b> new jobs</span><span><b>{run.data?.error_count??0}</b> errors</span></div>
+            {(run.data?.unfilled_count??0)>0&&<div className="shortfall-card"><strong>{run.data.unfilled_count} requested slots could not be filled</strong><p>{run.data?.mode==="turbo"?"All eligible primary and fallback sources were exhausted.":"Excluded sources will not run. The selected sources returned fewer eligible candidates than the requested budget."}</p>{run.data?.shortfall?.map((item:any)=><span key={item.sourceId}><b>{item.label}</b>: {item.returned} returned → {item.skippedRecent} recent skipped → {item.duplicates} duplicates → {item.queued} queued</span>)}</div>}
             <section className="worker-section"><h3>Active workers</h3><div className="worker-grid">{(run.data?.active_tasks??[]).map((task:any)=><article key={task.candidate_id}><div><span>{task.worker_id}</span><b>{String(task.stage).replaceAll("-"," ")}</b></div><strong>{task.job_title||task.company}</strong><small>{task.source_id} · {task.provider||"embedded feed"} · {duration(task.stage_elapsed_ms??0)}</small><p>{task.detail}</p>{(task.job_url||task.board_url)&&<a href={task.job_url||task.board_url} target="_blank" rel="noreferrer">Open public source</a>}</article>)}</div>{!(run.data?.active_tasks??[]).length&&<p className="worker-empty">Workers will appear when the candidate queue starts processing.</p>}</section>
             <section className="completion-section"><h3>Recent completions</h3><div className="completion-list">{(run.data?.attempts??[]).slice(0,8).map((attempt:any,index:number)=><article key={`${attempt.started_at}-${index}`}><strong>{attempt.company}</strong><span>{attempt.source_id} · {attempt.provider||"feed"}</span><b className={attempt.error_message?"error":""}>{attempt.result}</b><small>{duration(attempt.duration_ms??0)} · {attempt.jobs_fetched} fetched · {attempt.netherlands_jobs} Dutch · {attempt.profile_matches} matches</small></article>)}</div></section>
             <SourceBreakdown sources={run.data?.sources??[]} />
@@ -929,6 +1000,46 @@ function Discovery() {
       )}
     </Page>
   );
+}
+
+function Discovery(){
+  const durations=[5,10,20,30] as const,[durationMinutes,setDurationMinutes]=useState<number>(10),[active,setActive]=useState<string>(),[startError,setStartError]=useState<string>(),[enrichmentStarting,setEnrichmentStarting]=useState(false),[enrichmentMessage,setEnrichmentMessage]=useState<string>(),[manualUrl,setManualUrl]=useState(""),[manualLoading,setManualLoading]=useState(false),[manualError,setManualError]=useState<string>(),[manualResult,setManualResult]=useState<any>();
+  const preview=useData<any>(`/api/v1/discovery/plan?durationMinutes=${durationMinutes}`),history=useData<any>("/api/v1/discovery/runs"),activeCheck=useData<any>("/api/v1/discovery/active"),enrichment=useData<any>("/api/v1/enrichment/queue"),run=useData<any>(active?`/api/v1/discovery/runs/${active}`:"/api/v1/discovery/runs/none");
+  useEffect(()=>{if(activeCheck.data?.id)setActive(activeCheck.data.id)},[activeCheck.data?.id]);
+  useEffect(()=>{if(!active)return;const timer=setInterval(run.reload,1000);if(run.data&&["completed","partial","interrupted","failed"].includes(run.data.status)){clearInterval(timer);history.reload();setActive(undefined)}return()=>clearInterval(timer)},[active,run.data?.status]);
+  useEffect(()=>{const timer=setInterval(enrichment.reload,5000);return()=>clearInterval(timer)},[]);
+  const start=async()=>{setStartError(undefined);try{const result=await api<any>("/api/v1/discovery",{method:"POST",body:JSON.stringify({durationMinutes})});setActive(result.id)}catch(error){if(error instanceof ApiError&&error.status===409&&error.data?.activeRun?.id){setActive(error.data.activeRun.id);return}setStartError(error instanceof Error?error.message:String(error))}};
+  const runDueEnrichment=async()=>{setEnrichmentStarting(true);setEnrichmentMessage(undefined);try{const result=await api<any>("/api/v1/enrichment/queue/process",{method:"POST"});setEnrichmentMessage(result.status==="scheduled"?`Starting ${result.eligibleCount} due description${result.eligibleCount===1?"":"s"}.`:result.status==="running"?"Description enrichment is already running.":result.status==="waiting"?"Nothing is due yet; automatic retry remains scheduled.":"No description work is due.");await enrichment.reload()}catch(error){setEnrichmentMessage(error instanceof Error?error.message:String(error))}finally{setEnrichmentStarting(false)}};
+  const addManual=async(event:React.FormEvent)=>{event.preventDefault();setManualLoading(true);setManualError(undefined);setManualResult(undefined);try{const result=await api<any>("/api/v1/discovery/manual",{method:"POST",body:JSON.stringify({url:manualUrl,saveToPipeline:true})});setManualResult(result);setManualUrl("");history.reload()}catch(error){setManualError(error instanceof Error?error.message:String(error))}finally{setManualLoading(false)}};
+  const forecast=preview.data?.forecast,adaptive=run.data?.adaptive,remaining=Number(adaptive?.remainingSeconds??0),totalSeconds=Math.max(1,Number(adaptive?.durationMinutes??durationMinutes)*60),elapsed=Math.max(0,totalSeconds-remaining);
+  return <Page eyebrow="Adaptive collection" title="Discovery" actions={<button className="primary" disabled={!!active||preview.loading} onClick={start}>Start {durationMinutes}-minute discovery</button>}>
+    <div className={`enrichment-status ${enrichment.data?.runnerStatus?.state??"loading"}`}><div className="enrichment-status-head"><span className="enrichment-live-dot"/><div><strong>Description enrichment</strong><p>{enrichment.data?.runnerStatus?.state??"loading"} · {enrichment.data?.summary?.eligibleNow??0} ready · {enrichment.data?.summary?.coolingDown??0} cooling down</p></div><button onClick={runDueEnrichment} disabled={enrichmentStarting||!!active||enrichment.data?.runnerStatus?.state==="running"||enrichment.data?.runnerStatus?.state==="paused"||!(enrichment.data?.summary?.eligibleNow>0)}>{enrichmentStarting?"Starting...":"Run due now"}</button></div>{enrichmentMessage&&<p className="enrichment-message">{enrichmentMessage}</p>}</div>
+    <section className="evidence-section adaptive-plan">
+      <div className="section-heading"><div><p>Choose processing time</p><h2>Adaptive discovery</h2></div><small>The scheduler continuously moves workers toward sources producing new, recent, strong Netherlands matches.</small></div>
+      <div className="duration-presets" role="radiogroup" aria-label="Discovery processing time">{durations.map(value=><label className={durationMinutes===value?"selected":""} key={value}><input type="radio" name="duration" checked={durationMinutes===value} disabled={!!active} onChange={()=>setDurationMinutes(value)}/><strong>{value} minutes</strong></label>)}</div>
+      {preview.loading?<Loading/>:preview.error?<div className="error">{preview.error}</div>:<>
+        <div className="adaptive-forecast"><article><span>Expected useful matches</span><strong>~{forecast?.expectedUsefulMatches?.point??0}</strong><small>Likely {forecast?.expectedUsefulMatches?.lower??0}–{forecast?.expectedUsefulMatches?.upper??0} · {forecast?.confidence??"experimental"} confidence</small></article><article><span>Freshness objective</span><strong>1.0 / 0.4 / 0.1</strong><small>0–7 / 8–30 / 31–60 days · unknown dates earn zero</small></article><article><span>Automatic resources</span><strong>2–8 workers</strong><small>Adaptive concurrency with host and provider limits</small></article></div>
+        {forecast?.warnings?.map((warning:string)=><p className="forecast-warning" key={warning}>{warning}</p>)}
+        <div className="adaptive-ranking"><div className="section-heading"><div><p>Starting evidence</p><h3>Current arm ranking</h3></div><small>Rankings change after every completed pull.</small></div>{(forecast?.arms??[]).map((arm:any,index:number)=><article key={arm.armId}><b>{index+1}</b><div><strong>{arm.label}</strong><small>{arm.reason} · {arm.evidence} evidence</small></div><span>{arm.expectedRewardPerMinute.toFixed(2)} reward/min</span></article>)}</div>
+      </>}
+      {startError&&<div className="error">{startError}</div>}
+      {active&&<div className="adaptive-active">
+        <div className="run-status"><span className="phase-label">{run.data?.phase??"starting"}</span><strong>{run.data?.phase_message??"Starting adaptive scheduler…"}</strong><small>{adaptive?.currentConcurrency??4} adaptive workers · deadline {adaptive?.deadlineAt?new Date(adaptive.deadlineAt).toLocaleTimeString("en-NL",{hour:"2-digit",minute:"2-digit"}):"calculating"}</small></div>
+        <div className="adaptive-clock"><strong>{Math.floor(remaining/60)}:{String(remaining%60).padStart(2,"0")}</strong><span>{run.data?.phase==="draining"?"Draining active work":"remaining"}</span></div>
+        <progress value={elapsed} max={totalSeconds}/><button onClick={()=>api(`/api/v1/discovery/runs/${active}/cancel`,{method:"POST"})}>Cancel safely</button>
+        <div className="run-composition"><span><b>{run.data?.new_strong_count??0}</b> new strong matches</span><span><b>{run.data?.useful_match_count??0}</b> reward-eligible matches</span><span><b>{run.data?.recent_7_count??0}</b> 0–7 days</span><span><b>{run.data?.recent_30_count??0}</b> 8–30 days</span><span><b>{run.data?.recent_60_count??0}</b> 31–60 days</span><span><b>{run.data?.unknown_date_count??0}</b> unknown date, zero reward</span><span><b>{Number(run.data?.weighted_reward??0).toFixed(1)}</b> weighted reward</span><span><b>{run.data?.processed_count??0}</b> processed</span></div>
+        <section className="worker-section"><h3>Active workers</h3><div className="worker-grid">{(run.data?.active_tasks??[]).map((task:any)=><article key={task.candidate_id}><div><span>{task.worker_id}</span><b>{String(task.stage).replaceAll("-"," ")}</b></div><strong>{task.job_title||task.company}</strong><small>{task.source_id} · {task.provider||"feed"}</small><p>{task.detail}</p></article>)}</div></section>
+        <section className="adaptive-decisions"><h3>Recent scheduler decisions</h3>{(adaptive?.pulls??[]).slice(0,8).map((pull:any,index:number)=><article key={`${pull.started_at}-${index}`}><strong>{pull.label}</strong><span>{pull.returned} returned · {pull.queued_unique} uniquely queued · {pull.duplicates} true duplicates · {duration(pull.duration_ms)}</span><small>{pull.metadata?.exhaustedReason?`Status: ${String(pull.metadata.exhaustedReason).replaceAll("-"," ")} · `:""}Priority {Number(pull.metadata?.priorityScore??0).toFixed(2)} · expected {Number(pull.metadata?.expectedRewardPerMinute??0).toFixed(2)} reward/min</small></article>)}</section>
+        <TechnicalTrace runId={active}/>
+      </div>}
+    </section>
+    <section className="manual-discovery">
+      <div className="section-heading"><div><p>One-off collection</p><h2>Add a vacancy by URL</h2></div><small>Imports, scores, and saves it to your pipeline.</small></div>
+      <form onSubmit={addManual}><input aria-label="Vacancy URL" type="url" required placeholder="https://employer.nl/vacatures/role" value={manualUrl} disabled={manualLoading} onChange={event=>setManualUrl(event.target.value)}/><button className="primary" disabled={manualLoading||!manualUrl.trim()}>{manualLoading?"Importing…":"Add & save"}</button></form>
+      {manualError&&<div className="error">{manualError}</div>}{manualResult&&<p className="manual-result">Saved {manualResult.job?.title??manualResult.title??"vacancy"}.</p>}
+    </section>
+    {history.loading?<Loading/>:<RunList runs={history.data?.items??[]}/>}
+  </Page>
 }
 
 export default function AppV2() {

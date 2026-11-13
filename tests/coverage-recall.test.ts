@@ -12,7 +12,7 @@ import { processJob } from '../src/processing.js';
 import { hardExclusion } from '../src/scoring.js';
 import { collectSource, checkpointCollection } from '../src/collection.js';
 import { resolveProvider } from '../src/providers.js';
-import { buildDiscoveryPlan, buildQueue, defaultDiscoveryAllocations, discover, validateDiscoveryAllocations, validateDiscoveryWorkers } from '../src/discovery.js';
+import { buildDiscoveryPlan, buildQueue, buildTurboDiscoveryPlan, defaultDiscoveryAllocations, discover, validateDiscoveryAllocations, validateDiscoveryWorkers } from '../src/discovery.js';
 import { scan } from '../src/scanner.js';
 import { enrichPendingJobs, rescoreJobs } from '../src/quality.js';
 import { enrichJob } from '../src/enrichment.js';
@@ -107,6 +107,25 @@ test('failed enrichment persists cooldown, Retry-After, four-attempt stop and ma
  }finally{db.close();}
 });
 
+test('permanent enrichment failures become terminal without a cooldown',async()=>{
+ const db=database(),profile=await loadProfile();try{
+  db.store.startRun('run');processJob(base,{store:db.store,profile,sourceId:'fixture',provider:'browser',scanId:'run',candidate:{sourceId:'fixture',company:'Example',provider:'browser'}});
+  const result=await enrichPendingJobs({store:db.store,context:{...context,fetchText:async()=>{throw new HttpError('Not found',404,false);}}});
+  const row=db.store.db.prepare('SELECT status,attempts,next_retry_at FROM enrichment_queue').get() as any,summary=db.store.enrichmentQueueSummary();
+  assert.equal(result.failed,1);assert.equal(row.status,'terminal');assert.equal(row.attempts,1);assert.equal(row.next_retry_at,null);
+  assert.equal(summary.terminal,1);assert.equal(summary.eligibleNow,0);assert.equal(summary.coolingDown,0);
+ }finally{db.close();}
+});
+
+test('cancelled idle enrichment remains pending without consuming an attempt',async()=>{
+ const db=database(),profile=await loadProfile(),controller=new AbortController();try{
+  db.store.startRun('run');processJob(base,{store:db.store,profile,sourceId:'fixture',provider:'browser',scanId:'run',discoveryRunId:'origin-run',candidate:{sourceId:'fixture',company:'Example',provider:'browser'}});
+  const pending=enrichPendingJobs({store:db.store,signal:controller.signal,context:{fetchJson:async()=>({}),fetchText:async(_url,init)=>new Promise((_resolve,reject)=>init?.signal?.addEventListener('abort',()=>reject(init.signal?.reason),{once:true}))}});
+  setTimeout(()=>controller.abort(new Error('Discovery started')),5);const result=await pending,row=db.store.db.prepare('SELECT status,attempts FROM enrichment_queue').get() as any;
+  assert.equal(result.cancelled,1);assert.equal(row.status,'pending');assert.equal(row.attempts,0);
+ }finally{db.close();}
+});
+
 test('discovery, scan and profile reevaluation agree on possible matches',async()=>{
  const db=database();try{
   const source:DiscoverySource={id:'fixture',label:'Fixture',license:'test',kind:'job-feed',discover:async()=>({nextCursor:0,total:1,candidates:[{sourceId:'fixture',company:'Example',jobs:[{...base,location:'Remote - Europe',description:'A role in predictive analytics using Python. '.repeat(5)}]}]})};
@@ -115,6 +134,14 @@ test('discovery, scan and profile reevaluation agree on possible matches',async(
   const candidate={sourceId:'fixture',company:'Example',boardUrl:'https://job-boards.greenhouse.io/example',provider:'greenhouse' as const};const employer=db.store.upsertEmployer(candidate,'example','example',1);db.store.upsertEmployerBoard(employer,candidate,'board','healthy');db.store.observeVacancy(employer,'fixture',base,'known-nl-fixture',true);
   await scan({store:db.store,provider:'greenhouse',context:{...context,fetchJson:async()=>({jobs:[{id:'1',title:'Data Scientist',location:{name:'Remote - Europe'},content:'A role in predictive analytics using Python. '.repeat(5),absolute_url:base.url}]})}});
   assert.equal((db.store.job(row.id) as any).match_state,'possible');assert.ok(db.store.decisions(row.id).length>=3);
+ }finally{db.close();}
+});
+
+test('discovery queues 300 missing descriptions without waiting for enrichment',async()=>{
+ const db=database(),count=300,source:DiscoverySource={id:'fast-fixture',label:'Fast fixture',license:'test',kind:'job-feed',discover:async(_ctx,cursor,limit)=>({nextCursor:count,total:count,candidates:Array.from({length:Math.min(limit,count-cursor)},(_,index)=>{const id=cursor+index;return {sourceId:'fast-fixture',company:'Example',jobs:[{...base,url:`https://example.test/jobs/${id}`,description:undefined}]};})})};
+ try{
+  const started=Date.now(),result=await discover({store:db.store,sources:[source],limit:count,context:{fetchJson:async()=>{throw new Error('discovery must not enrich')},fetchText:async()=>{throw new Error('discovery must not enrich')}}});
+  assert.equal(result.processed,count);assert.equal(result.deferredEnrichments,count);assert.equal(db.store.pendingEnrichmentCount(),count);assert.ok(Date.now()-started<30_000);
  }finally{db.close();}
 });
 
@@ -181,6 +208,26 @@ test('worker counts validate and source yield policy redistributes only qualifyi
  }finally{db.close();}
 });
 
+test('turbo plan allocates exact budgets to fast feeds and keeps proven boards as ordered fallback',async()=>{
+ const db=database();try{
+  const guardrailPlan=buildTurboDiscoveryPlan(100,Array.from({length:5},(_,index)=>({id:`guardrail-${index}`,label:`Guardrail ${index}`,license:'test',kind:'job-feed' as const,discover:async()=>({candidates:[],nextCursor:0})})),db.store);assert.ok(guardrailPlan.sources.every(row=>row.planned>=5&&row.planned<=40));assert.equal(guardrailPlan.sources.reduce((sum,row)=>sum+row.planned,0),100);
+  db.store.startDiscoveryRun('poor-evidence',undefined,20);for(let index=0;index<20;index++)db.store.recordDiscoveryAttempt({runId:'poor-evidence',sourceId:'poor-board',company:`Poor ${index}`,startedAt:new Date().toISOString(),durationMs:3000,result:'network-error',retryable:true,jobsFetched:0,netherlandsJobs:0,profileMatches:0,candidate:{sourceId:'poor-board',company:`Poor ${index}`}});
+  let release!:()=>void,started=0,fallbackCalls=0;const gate=new Promise<void>(resolve=>{release=resolve});
+  const feed=(id:string):DiscoverySource=>({id,label:id,license:'test',kind:'job-feed',discover:async(_context,_cursor,limit)=>{started++;await gate;return {candidates:Array.from({length:limit},(_,index)=>({sourceId:id,company:`${id}-${index}`,jobs:[{...base,url:`https://example.test/${id}/${index}`}]})),nextCursor:limit,total:limit}}});
+  const sources:DiscoverySource[]=[feed('fast-a'),feed('fast-b'),{id:'fallback-board',label:'Fallback',license:'test',kind:'board-directory',discover:async()=>{fallbackCalls++;return {candidates:[],nextCursor:0,total:0}}},{id:'poor-board',label:'Poor',license:'test',kind:'board-directory',discover:async()=>({candidates:[],nextCursor:0,total:0})}];
+  const plan=buildTurboDiscoveryPlan(3,sources,db.store);assert.equal(plan.rules.selectionPolicy,'turbo-tiered');assert.equal(plan.sources.reduce((sum,row)=>sum+row.planned,0),3);assert.ok(plan.sources.filter(row=>row.tier==='primary').every(row=>row.kind==='job-feed'));assert.equal(plan.sources.find(row=>row.id==='fallback-board')?.tier,'fallback');assert.equal(plan.sources.find(row=>row.id==='poor-board')?.tier,'excluded');
+  db.store.startDiscoveryRun('turbo-plan',undefined,3,plan,'turbo',8);const building=buildQueue('turbo-plan',3,sources,db.store,context,1000,undefined,()=>{},false,plan,'turbo');for(let index=0;index<20&&started<2;index++)await new Promise(resolve=>setTimeout(resolve,1));assert.equal(started,2,'primary feeds begin concurrently');release();await building;assert.equal(fallbackCalls,0,'fallback is untouched when primary feeds fill the budget');assert.equal(db.store.discoveryQueue('turbo-plan').length,3);const run:any=db.store.discoveryRun('turbo-plan');assert.equal(run.selection_policy,'turbo-tiered');assert.equal(run.sources.find((row:any)=>row.source_id==='fallback-board').tier,'fallback');
+ }finally{db.close();}
+});
+
+test('turbo always records eight workers even when a lower count is supplied',async()=>{
+ const db=database();try{const result=await discover({store:db.store,mode:'turbo',concurrency:1,limit:1,sources:[{id:'empty-fast',label:'Empty',license:'test',kind:'job-feed',discover:async()=>({candidates:[],nextCursor:0,total:0})}],context});assert.equal((db.store.discoveryRun(result.id) as any).worker_count,8);}finally{db.close();}
+});
+
+test('turbo consults a proven fallback only after fast feeds underfill',async()=>{
+ const db=database();try{let fallbackCalls=0;const sources:DiscoverySource[]=[{id:'empty-feed',label:'Empty feed',license:'test',kind:'job-feed',discover:async()=>({candidates:[],nextCursor:0,total:0})},{id:'fallback-directory',label:'Fallback directory',license:'test',kind:'board-directory',discover:async(_context,_cursor,limit)=>{fallbackCalls++;return {candidates:Array.from({length:limit},(_,index)=>({sourceId:'fallback-directory',company:`Fallback ${index}`,jobs:[{...base,url:`https://example.test/fallback/${index}`}]})),nextCursor:limit,total:limit}}}];const plan=buildTurboDiscoveryPlan(2,sources,db.store);db.store.startDiscoveryRun('turbo-fallback',undefined,2,plan,'turbo',8);await buildQueue('turbo-fallback',2,sources,db.store,context,1000,undefined,()=>{},false,plan,'turbo');assert.equal(fallbackCalls,1);assert.equal(db.store.discoveryQueue('turbo-fallback').length,2);assert.equal((db.store.discoveryRun('turbo-fallback') as any).sources.find((row:any)=>row.source_id==='fallback-directory').reassigned_count,2);}finally{db.close();}
+});
+
 test('fresh and refresh-known modes classify repeat candidates transparently',async()=>{
  const db=database();try{
   const old={sourceId:'known-netherlands',company:'Seen company',provider:'greenhouse' as const,boardUrl:'https://job-boards.greenhouse.io/seen'},fresh={sourceId:'known-netherlands',company:'Fresh company',provider:'greenhouse' as const,boardUrl:'https://job-boards.greenhouse.io/fresh'};
@@ -234,11 +281,11 @@ test('strict allocations never query zero-allocation sources when LinkedIn and I
  }finally{db.close();}
 });
 
-test('site failures do not trip a circuit for unrelated employers; partial queues resume',async()=>{
+test('provider circuit pauses repeated transient failures and partial queues resume',async()=>{
  const db=database();try{
   const distinct:DiscoverySource={id:'distinct',label:'distinct',license:'test',kind:'board-directory',discover:async()=>({nextCursor:0,total:10,candidates:Array.from({length:10},(_,i)=>({sourceId:'distinct',company:'Example '+i,provider:'browser',boardUrl:'https://employer-'+i+'.test/jobs'}))})};
   const fail:FetchContext={fetchJson:async()=>{throw new HttpError('Network error',503,true);},fetchText:async()=>{throw new HttpError('Network error',503,true);}};
-  const result=await discover({store:db.store,sources:[distinct],limit:10,context:fail});assert.equal(result.processed,10);
+  const result=await discover({store:db.store,sources:[distinct],limit:10,context:fail});assert.ok(result.processed>=5&&result.processed<10);assert.ok(result.pending>0);
   const same:DiscoverySource={...distinct,id:'same',discover:async()=>({nextCursor:0,total:10,candidates:Array.from({length:10},(_,i)=>({sourceId:'same',company:'Example '+i,provider:'greenhouse',boardUrl:'https://job-boards.greenhouse.io/failure-'+i}))})};
   const first=await discover({store:db.store,source:'same',sources:[same],limit:10,context:fail});assert.ok(first.pending>0);
   const resumed=await discover({store:db.store,source:'same',sources:[same],limit:10,resume:true,context:{...context,fetchJson:async()=>({jobs:[]})}});assert.equal(resumed.id,first.id);assert.equal(resumed.pending,0);assert.equal(resumed.processed,10);

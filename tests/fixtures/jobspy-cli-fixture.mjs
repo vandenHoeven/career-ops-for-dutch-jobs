@@ -9,7 +9,7 @@ else {
   glassdoor:{site:'glassdoor',id:'gd-987',job_url:'https://www.glassdoor.nl/job-listing/data-scientist.htm?jl=987',title:'Data Scientist',company:'Canal AI',location:'Utrecht, Netherlands',date_posted:'2026-10-30',is_remote:true,description:'Build machine learning models.'}
  };
  if(rows[site]){
-  const row=query==='data'?rows[site]:{...rows[site],id:`${site}-${createHash('sha1').update(query+'|'+location).digest('hex').slice(0,12)}`,job_url:`https://jobs.example.test/${site}/${encodeURIComponent(query)}/${encodeURIComponent(location)}`,title:query.replaceAll('"','').split(' OR ')[0],location:`${location}, Netherlands`};
+  const base=query==='data'?rows[site]:{...rows[site],id:`${site}-${createHash('sha1').update(query+'|'+location).digest('hex').slice(0,12)}`,job_url:`https://jobs.example.test/${site}/${encodeURIComponent(query)}/${encodeURIComponent(location)}`,title:query.replaceAll('"','').split(' OR ')[0],location:`${location}, Netherlands`},row={...base,fixture_hours_old:args[args.indexOf('--hours-old')+1],fixture_results_wanted:args[args.indexOf('--results-wanted')+1]};
   process.stdout.write(JSON.stringify(row)+'\n');
  }
 }

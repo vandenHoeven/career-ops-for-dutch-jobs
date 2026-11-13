@@ -1,7 +1,7 @@
 import type { FetchContext, RawJob } from './types.js';
 import { postingObjects, parsePublicPostings, plainText } from './posting-parser.js';
 import { HttpError } from './http.js';
-export interface EnrichmentResult {job:RawJob;status:'complete'|'unavailable'|'failed'|'not-needed';error?:string;retryAfterMs?:number}
+export interface EnrichmentResult {job:RawJob;status:'complete'|'unavailable'|'failed'|'not-needed';error?:string;retryAfterMs?:number;retryable?:boolean}
 export function withEnrichmentSource(job:RawJob,source:{provider?:string;boardUrl?:string;apiUrl?:string}):RawJob {
   if(source.provider!=='workday'||!source.boardUrl||(job.raw as any)?._diegoDetailApi)return job;
   try{const board=new URL(source.boardUrl),segments=board.pathname.split('/').filter(Boolean),at=segments.findIndex(s=>s==='job'||s==='jobs'),site=at>0?segments[at-1]:segments.at(-1)??'External',path=(job.raw as any)?.externalPath??new URL(job.url).pathname.match(/\/job\/.*/)?.[0];
@@ -25,6 +25,6 @@ export async function enrichJob(job:RawJob,context:FetchContext):Promise<Enrichm
     const scoped=html.match(/<[^>]+itemprop=["']description["'][^>]*>([\s\S]*?)<\/[^>]+>/i)?.[1]??html.match(/<main\b[^>]*>([\s\S]*?)<\/main>/i)?.[1]??'';
     const description=posting?.description??(typeof object?.description==='string'?plainText(object.description):plainText(scoped.replace(/<(header|footer|nav)\b[^>]*>[\s\S]*?<\/\1>/gi,'')));
     const merged={...job,...(posting?{location:posting.location||job.location,countryCode:posting.countryCode??job.countryCode,structuredRoleTerms:posting.structuredRoleTerms,raw:{...(job.raw as any),jobLocation:(posting.raw as any)?.jobLocation}}:{}),description:description||job.description};
-    return description.length>=160?{job:merged,status:'complete'}:{job:merged,status:'unavailable',error:'Public posting did not contain a usable job-specific description'};
-  }catch(error){return {job,status:'failed',error:(error instanceof Error?error.message:String(error)).replace(/[\r\n\t]+/g,' ').slice(0,500),retryAfterMs:error instanceof HttpError?error.retryAfterMs:undefined};}
+    return description.length>=160?{job:merged,status:'complete'}:{job:merged,status:'unavailable',error:'Public posting did not contain a usable job-specific description',retryable:false};
+  }catch(error){return {job,status:'failed',error:(error instanceof Error?error.message:String(error)).replace(/[\r\n\t]+/g,' ').slice(0,500),retryAfterMs:error instanceof HttpError?error.retryAfterMs:undefined,retryable:error instanceof HttpError?error.retryable:true};}
 }

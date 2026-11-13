@@ -7,6 +7,38 @@ export type JobStatus = "active" | "uncertain" | "expired";
 export type ReviewState = "new" | "reviewed" | "declined" | "archived";
 export type ApplicationStage = "saved" | "preparing" | "applied" | "screening" | "interview" | "assessment" | "offer" | "hired" | "rejected" | "withdrawn";
 export type EnrichmentStatus = "complete" | "unavailable" | "failed" | "not-needed";
+export type LocationAccessTier = "easy" | "medium" | "hard" | "remote" | "unknown";
+export type LocationTransportMode = "direct-train" | "train-transfer" | "bus" | "car-only";
+
+export interface LocationAccessCityProfile {
+  city: string;
+  aliases?: string[];
+  distanceKm: number;
+  publicTransportMinutes?: number;
+  mode: LocationTransportMode;
+  source?: string;
+  updatedAt?: string;
+}
+
+export interface LocationAccessibilityPreferences {
+  easyMaxMinutes: number;
+  mediumMaxMinutes: number;
+  closeOverrideKm: number;
+  modePenalties: { "direct-train": number; "train-transfer": number; bus: number };
+  cityProfiles: LocationAccessCityProfile[];
+}
+
+export interface LocationAccessAssessment {
+  tier: LocationAccessTier;
+  matchedCity?: string;
+  distanceKm?: number;
+  publicTransportMinutes?: number;
+  mode?: LocationTransportMode;
+  penaltyMinutes?: number;
+  effectiveMinutes?: number;
+  confidence: "configured" | "unknown";
+  explanation: string;
+}
 
 export interface SourceConfig {
   id: string;
@@ -117,6 +149,7 @@ export interface ProfileConfig {
   excludedSeniority?: string[];
   languages?: string[];
   preferredLocations?: string[];
+  locationPenalties?: Record<string, number>;
   locationPreferences?: {
     anchor: { city: string; aliases?: string[]; latitude: number; longitude: number };
     stronglyPreferredCities: string[];
@@ -124,6 +157,7 @@ export interface ProfileConfig {
     distanceBandKm?: number;
     includeRestOfNetherlands?: boolean;
     foreignLocations?: "exclude";
+    accessibility?: LocationAccessibilityPreferences;
   };
   preferredWorkArrangements?: WorkArrangement[];
   dealBreakers?: string[];
@@ -154,6 +188,8 @@ export interface EmployerBoard {
 export interface DiscoveryCandidate {
   contributingSources?: string[];
   cursor?: string;
+  searchArmId?: string;
+  searchArmLabel?: string;
   sourceId: string; company: string; domain?: string; headquarters?: Headquarters;
   sizeBand?: string; sizeConfidence?: SizeConfidence; sizeEvidence?: string;
   boardUrl?: string; apiUrl?: string; provider?: ProviderId; jobs?: RawJob[];
@@ -161,10 +197,15 @@ export interface DiscoveryCandidate {
   discoveryEvidence?: { method: string; queryOrUrl: string; resolvedUrl?: string; confidence: number; result: string; error?: string };
 }
 
+export interface DiscoverySourceArm { id:string; label:string; metadata?:Record<string,unknown>; }
+export interface DiscoveryBatch { candidates:DiscoveryCandidate[]; nextCursor:number; total?:number; arm?:DiscoverySourceArm; exhaustedReason?:"all-arms-queried"|"cooling-down"|"no-results"; }
+
 export interface DiscoverySource {
   id: string; label: string; license: string; kind: "board-directory" | "job-feed";
   experimental?: boolean;
-  discover(context: FetchContext, cursor: number, limit: number): Promise<{ candidates: DiscoveryCandidate[]; nextCursor: number; total?: number }>;
+  discover(context: FetchContext, cursor: number, limit: number): Promise<DiscoveryBatch>;
+  listArms?():Promise<DiscoverySourceArm[]>;
+  discoverArm?(context:FetchContext,arm:DiscoverySourceArm,limit:number):Promise<DiscoveryBatch>;
 }
 
 export type DiscoveryAttemptResult = "matched" | "no-netherlands-jobs" | "empty-board" | "unsupported" | "board-not-found" | "timeout" | "rate-limited" | "network-error" | "parse-error" | "invalid-record";
@@ -174,4 +215,5 @@ export interface DiscoveryAttempt {
   startedAt: string; durationMs: number; result: DiscoveryAttemptResult; httpStatus?: number;
   retryable: boolean; errorMessage?: string; jobsFetched: number; netherlandsJobs: number;
   profileMatches: number; collectionPartial?: boolean; continuation?: string; candidate: DiscoveryCandidate;
+  collectionDurationMs?: number;
 }

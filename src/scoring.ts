@@ -9,7 +9,7 @@ import type {
 import { scoreLocation } from "./locations.js";
 import { phrase, jobSpecificText } from './text.js';
 
-export const SCORING_VERSION = "4";
+export const SCORING_VERSION = "5";
 const normalizeText = (value: string): string =>
   value
     .toLowerCase()
@@ -325,17 +325,22 @@ export function scoreJob(
   const negative = (profile.negativeTerms ?? []).filter((term) =>
     text.includes(normalizeText(term)),
   );
-  const penalty = Math.min(20, negative.length * 5);
+  const negativeTermPenalty = Math.min(20, negative.length * 5),
+    matchedLocationPenalties = Object.entries(profile.locationPenalties ?? {})
+      .map(([term, points]) => ({ term, points: Math.max(0, Number(points)) }))
+      .filter(({ term, points }) => points > 0 && Number.isFinite(points) && phrase(job.location, term)),
+    locationPenalty = matchedLocationPenalties.reduce((maximum, item) => Math.max(maximum, item.points), 0),
+    penalty = negativeTermPenalty + locationPenalty;
   components.push({
     key: "penalties",
     label: "Penalties",
     awarded: -penalty,
     maximum: 0,
-    rule: "−5 per configured negative term, maximum −20",
-    evidence: negative,
-    explanation: negative.length
-      ? `Matched negative terms: ${negative.join(", ")}`
-      : "No configured negative terms matched",
+    rule: "−5 per configured negative term, maximum −20; largest matching configured location penalty also applies",
+    evidence: [...negative, ...matchedLocationPenalties.map(item => `${item.term} location (−${item.points})`)],
+    explanation: penalty
+      ? [negative.length ? `Matched negative terms: ${negative.join(", ")}` : "", locationPenalty ? `Location penalty: −${locationPenalty} for ${matchedLocationPenalties.find(item => item.points === locationPenalty)?.term}` : ""].filter(Boolean).join("; ")
+      : "No configured negative terms or location penalties matched",
   });
   const score = Math.max(
     0,

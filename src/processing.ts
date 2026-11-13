@@ -3,6 +3,7 @@ import { profileFingerprint, SCORING_VERSION, scoreJob } from './scoring.js';
 import { Store } from './database.js';
 import type { DiscoveryCandidate, JobPosting, ProfileConfig, ProviderId, RawJob } from './types.js';
 import { plainText } from './posting-parser.js';
+import { classifyLocationAccess } from './locations.js';
 
 export interface ProcessingOptions {
   store: Store; profile: ProfileConfig; sourceId: string; provider: ProviderId;
@@ -35,7 +36,8 @@ export function processJob(job: RawJob, options: ProcessingOptions) {
     }
     const ai=(store.job(id) as any)?.ai_score,overall=decision.matchState==='excluded'?0:ai==null?quality.score:Math.round(quality.score*.7+Number(ai)*.3);
     quality.breakdown.overallScore=overall;if(ai!=null)quality.breakdown.aiScore=Number(ai);
-    store.updateJobQuality(id,{description:full?job.description:undefined,enrichmentStatus:options.enrichmentStatus??'not-needed',enrichmentError:options.enrichmentError,ruleScore:quality.score,overallScore:overall,breakdown:quality.breakdown,scoringVersion:SCORING_VERSION,profileFingerprint:profileFingerprint(profile),seniority:quality.seniority,workArrangement:posting.workArrangement});
+    const locationAccess=classifyLocationAccess({location:posting.location,workArrangement:posting.workArrangement,raw:posting.raw},profile);
+    store.updateJobQuality(id,{description:full?job.description:undefined,enrichmentStatus:options.enrichmentStatus??'not-needed',enrichmentError:options.enrichmentError,ruleScore:quality.score,overallScore:overall,breakdown:quality.breakdown,scoringVersion:SCORING_VERSION,profileFingerprint:profileFingerprint(profile),seniority:quality.seniority,workArrangement:posting.workArrangement,locationAccess});
     store.updateMatch(id,decision.matchState,decision.reasons);
   }
   // Unrelated/excluded records keep identity and compact evidence, not whole page bodies.
