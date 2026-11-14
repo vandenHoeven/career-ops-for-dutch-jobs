@@ -776,7 +776,7 @@ export async function discover(
             if(employerId)for(const job of jobs){
               const needsEnrichment=(job.description?.trim().length??0)<160;
               const processed=processJob(job,{store,profile,sourceId:candidate.sourceId,provider:candidate.provider??'browser',scanId,discoveryRunId:id,candidateId:idValue,boardUrl:candidate.boardUrl,candidate:normalizedCandidate,employerId,enrichmentStatus:needsEnrichment?'pending':'not-needed'});
-              if(isNetherlandsJob(job,profile)){store.observeVacancy(employerId,candidate.sourceId,job,fingerprint(job),processed.decision.retain);if(adaptive)store.recordDiscoveryOutcome(id,processed.id,normalizedCandidate,job.postedAt,{isNew:processed.write==='new',matchState:processed.decision.matchState});}
+              if(isNetherlandsJob(processed.job,profile)){store.observeVacancy(employerId,candidate.sourceId,processed.job,fingerprint(processed.job),processed.decision.retain);if(adaptive)store.recordDiscoveryOutcome(id,processed.id,normalizedCandidate,processed.job.postedAt,{isNew:processed.write==='new',matchState:processed.decision.matchState});}
               if(processed.decision.retain){matches++;processed.write==='new'?newJobs++:refreshedJobs++;if(needsEnrichment){counts.descriptionCandidates++;counts.deferredEnrichments++;}if(processed.decision.evidence?.matchedFrom==='description')counts.descriptionMatches++;}
               else counts.nonmatching++;
             }
@@ -881,6 +881,14 @@ export async function discover(
       descriptionMatches: counts.descriptionMatches,
       enrichmentFailures: counts.enrichmentFailures,
     };
+  } catch(error) {
+    const message=(error instanceof Error?error.message:String(error)).replace(/[\r\n\t]+/g,' ').slice(0,500);
+    try{
+      store.failDiscoveryRun(id,message);
+      store.recordDiscoveryEvent(id,{phase:'failed',type:'run-failed',level:'error',message});
+      store.finishRun(scanId,'failed');
+    }catch{/* Preserve the original discovery failure. */}
+    throw error;
   } finally {
     clearInterval(heartbeat);
     if (options.handleSignals) process.removeListener("SIGINT", abort);

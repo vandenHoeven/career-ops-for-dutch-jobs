@@ -9,6 +9,7 @@ import { Store } from "../src/database.js";
 import type { DiscoverySource, FetchContext, ProfileConfig } from "../src/types.js";
 import { HttpError } from "../src/http.js";
 import { enrichPendingJobs } from '../src/quality.js';
+import { parsePublicPostings } from '../src/posting-parser.js';
 
 test('pending enrichment stores a description match once and marks its queue record complete',async()=>{
  const dir=mkdtempSync(join(tmpdir(),'diego-enrich-pending-')),store=new Store(join(dir,'test.sqlite'));
@@ -40,6 +41,34 @@ test("government adapter reads JobPosting JSON-LD", () => {
   const html = `<script type="application/ld+json">{"@type":"JobPosting","title":"Data Scientist","url":"https://werkenvoornederland.nl/job/1","datePosted":"2026-10-28","hiringOrganization":{"name":"CBS"},"jobLocation":{"address":{"addressLocality":"Den Haag","addressCountry":"Netherlands"}}}</script>`;
   const rows = parseWerkenVoorNederland(html);
   assert.equal(rows.length, 1); assert.equal(rows[0].company, "CBS"); assert.equal(rows[0].headquarters, "netherlands");
+});
+
+test("public posting parser rejects structured date values", () => {
+  const html=`<script type="application/ld+json">{"@type":"JobPosting","title":"Data Scientist","datePosted":{"value":"2026-10-28"},"validThrough":["2026-11-30"],"url":"https://example.test/jobs/1"}</script>`;
+  const [job]=parsePublicPostings(html,"https://example.test/jobs/1","Example");
+  assert.equal(job.postedAt,undefined);
+  assert.equal(job.validThrough,undefined);
+});
+
+test("malformed provider dates are stored as unknown without aborting discovery",async()=>{
+  const dir=mkdtempSync(join(tmpdir(),"diego-malformed-date-")),store=new Store(join(dir,"test.sqlite"));
+  const source:DiscoverySource={id:"malformed-date",label:"Malformed date",license:"fixture",kind:"job-feed",async discover(){return{nextCursor:1,total:1,candidates:[{sourceId:"malformed-date",company:"Example",provider:"browser",jobs:[{company:"Example",title:"Data Scientist",location:"Amsterdam, Netherlands",url:"https://example.test/jobs/1",postedAt:{value:"2026-10-28"} as any,raw:{}}]}]}}};
+  try{
+    const result=await discover({store,sources:[source],limit:1});
+    assert.equal(result.status,"completed");
+    assert.equal((store.db.prepare("SELECT posted_at FROM jobs LIMIT 1").get() as any).posted_at,null);
+  }finally{store.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+test("unexpected discovery failures are finalized immediately",async()=>{
+  const dir=mkdtempSync(join(tmpdir(),"diego-run-failure-")),store=new Store(join(dir,"test.sqlite"));
+  const source:DiscoverySource={id:"fatal",label:"Fatal",license:"fixture",kind:"job-feed",async discover(){return{nextCursor:1,total:1,candidates:[{sourceId:"fatal",company:"Example",provider:"browser",jobs:[{company:"Example",title:"Data Scientist",location:"Amsterdam, Netherlands",url:"not-a-url",raw:{}}]}]}}};
+  try{
+    await assert.rejects(discover({runId:"fatal-run",store,sources:[source],limit:1}),/Invalid URL/);
+    const row=store.db.prepare("SELECT status,phase,finished_at FROM discovery_runs WHERE id='fatal-run'").get() as any;
+    assert.equal(row.status,"failed");assert.equal(row.phase,"failed");assert.ok(row.finished_at);
+    assert.equal((store.db.prepare("SELECT COUNT(*) count FROM discovery_run_tasks WHERE run_id='fatal-run'").get() as any).count,0);
+  }finally{store.close();rmSync(dir,{recursive:true,force:true});}
 });
 
 test("government detail uses its page URL when JobPosting metadata omits url", () => {

@@ -12,8 +12,38 @@ export interface ProcessingOptions {
   firstSeenAt?:string;
   candidate?: DiscoveryCandidate; employerId?: string;
 }
+function optionalText(value:unknown):string|undefined {
+  return typeof value==='string'?value:undefined;
+}
+function runtimeDate(value:unknown):string|undefined {
+  if(typeof value==='string')return value.trim()||undefined;
+  return value instanceof Date&&!Number.isNaN(value.valueOf())?value.toISOString():undefined;
+}
+/** Provider payloads are untrusted at runtime even when their adapters are typed. */
+export function normalizeRawJob(job:RawJob):RawJob {
+  const value=job as unknown as Record<string,unknown>,arrangement=value.workArrangement;
+  return {
+    ...job,
+    company:optionalText(value.company)??'',
+    title:optionalText(value.title)??'',
+    location:optionalText(value.location)??'',
+    url:optionalText(value.url)??'',
+    countryCode:optionalText(value.countryCode),
+    externalId:optionalText(value.externalId),
+    description:optionalText(value.description),
+    applyUrl:optionalText(value.applyUrl),
+    postedAt:runtimeDate(value.postedAt),
+    firstObservedAt:runtimeDate(value.firstObservedAt),
+    summary:optionalText(value.summary),
+    validThrough:runtimeDate(value.validThrough),
+    workArrangement:arrangement==='onsite'||arrangement==='hybrid'||arrangement==='remote'||arrangement==='unknown'?arrangement:undefined,
+    structuredRoleTerms:Array.isArray(value.structuredRoleTerms)?value.structuredRoleTerms.filter((term):term is string=>typeof term==='string'):undefined,
+    raw:value.raw??{},
+  };
+}
 /** All ingestion and reevaluation paths use this decision, persistence and scoring boundary. */
 export function processJob(job: RawJob, options: ProcessingOptions) {
+  job=normalizeRawJob(job);
   if(job.description)job={...job,description:plainText(job.description)};
   if(job.countryCode||job.structuredRoleTerms)job={...job,raw:{...(job.raw as any),...(job.countryCode?{_diegoCountryCode:job.countryCode}:{}),...(job.structuredRoleTerms?{_diegoStructuredRoleTerms:job.structuredRoleTerms}:{})}};
   const {store,profile}=options, decision=evaluateJob(job,profile), print=fingerprint(job), url=canonicalizeUrl(job.url);
@@ -45,5 +75,5 @@ export function processJob(job: RawJob, options: ProcessingOptions) {
   if(options.candidate && decision.retain && (!job.description || job.description.length<160) && options.enrichmentStatus!=='complete') {
     store.queueEnrichment(stableJobId('enrichment',job),job,options.candidate,options.employerId,options.discoveryRunId??options.scanId??'reevaluation');
   }
-  return {decision,id,write};
+  return {decision,id,write,job};
 }
