@@ -600,7 +600,7 @@ export async function discover(
         : zeroCounts();
     if(adaptive)for(const source of configuredSources)if(source.listArms)adaptiveArmsBySource.set(source.id,await source.listArms());
     const employerIds = new Set<string>(),
-      circuit = new Map<string, number>(),providerCircuit=new Map<string,number>();
+      circuit = new Map<string, number>(),providerCircuit=new Map<string,number>(),reportedProviderCircuits=new Set<string>();
     counts.errors += sourceErrors;
     const pullAdaptive=async():Promise<Array<{ordinal:number;candidateId:string;candidate:DiscoveryCandidate}>>=>{
       if(!adaptive||Date.now()>=deadlineAt||adaptiveExhausted.size>=configuredSources.length)return [];
@@ -808,8 +808,13 @@ export async function discover(
           return outcome;
           }finally{store.finishDiscoveryTask(id,idValue);}});
     };
+    const circuitAllows=(item:{candidate:DiscoveryCandidate})=>{
+      const key=destinationHost(item.candidate),provider=item.candidate.provider??"embedded";
+      return (circuit.get(key)??0)<5&&(providerCircuit.get(provider)??0)<5;
+    };
     while((active.size||(!adaptive&&waiting.length)||(adaptive&&Date.now()<deadlineAt&&(waiting.length||adaptiveExhausted.size<configuredSources.length)))&&!controller.signal.aborted){
-      if(adaptive&&Date.now()<deadlineAt&&waiting.length<currentConcurrency*2&&adaptiveExhausted.size<configuredSources.length){const added=await pullAdaptive();const known=new Set(waiting.map(item=>item.candidateId));for(const item of added)if(!known.has(item.candidateId))waiting.push(item);}
+      const launchableWaiting=waiting.filter(circuitAllows).length;
+      if(adaptive&&Date.now()<deadlineAt&&launchableWaiting<currentConcurrency*2&&adaptiveExhausted.size<configuredSources.length){const added=await pullAdaptive();const known=new Set(waiting.map(item=>item.candidateId));for(const item of added)if(!known.has(item.candidateId))waiting.push(item);}
       let launched=false;
       if(adaptive){const candidateScores=new Map(waiting.map(item=>[item.candidateId,store.adaptiveCandidateScore(item.candidate)]));waiting.sort((a,b)=>(candidateScores.get(b.candidateId)??0)-(candidateScores.get(a.candidateId)??0)||a.ordinal-b.ordinal);}
       while(active.size<currentConcurrency&&availableSlots.length&&(!adaptive||Date.now()<deadlineAt)){
@@ -821,7 +826,20 @@ export async function discover(
         void promise.then(release,()=>release());
       }
       if(active.size){if(adaptive&&Date.now()>=drainDeadlineAt){controller.abort(new Error("Discovery drain deadline reached"));break;}await Promise.race(active);}
-      else if(!launched){for(const [provider,failures] of providerCircuit)if(failures>=5)store.recordDiscoveryEvent(id,{phase:"processing",type:"provider-circuit-open",level:"error",message:`${provider} paused after ${failures} consecutive transient failures`,metadata:{provider,failures,pending:waiting.filter(item=>(item.candidate.provider??"embedded")===provider).length}});if(adaptive&&Date.now()<deadlineAt&&adaptiveExhausted.size<configuredSources.length)continue;break;}
+      else if(!launched){
+        for(const [provider,failures] of providerCircuit)if(failures>=5&&!reportedProviderCircuits.has(provider)){
+          reportedProviderCircuits.add(provider);
+          store.recordDiscoveryEvent(id,{phase:"processing",type:"provider-circuit-open",level:"error",message:`${provider} paused after ${failures} consecutive transient failures`,metadata:{provider,failures,pending:waiting.filter(item=>(item.candidate.provider??"embedded")===provider).length}});
+        }
+        if(adaptive&&Date.now()<deadlineAt&&adaptiveExhausted.size<configuredSources.length){
+          // A provider circuit can leave queued candidates temporarily
+          // unlaunchable. Yield before selecting another source so the API,
+          // heartbeat, cancellation, and dashboard polling stay responsive.
+          await new Promise<void>(resolve=>setTimeout(resolve,25));
+          continue;
+        }
+        break;
+      }
     }
     if(active.size)await Promise.all(active);
     if(adaptive)store.db.prepare("UPDATE discovery_queue SET status='expired',updated_at=? WHERE run_id=? AND status='pending'").run(new Date().toISOString(),id);

@@ -96,19 +96,23 @@ function useData<T>(path: string) {
       loading: boolean;
       error?: string;
     }>({ loading: true });
+  const loadingRef = useRef(false);
   useEffect(() => {
     let live = true;
+    loadingRef.current = true;
     setState((s) => ({ ...s, loading: true, error: undefined }));
     api<T>(path)
       .then((data) => live && setState({ data, loading: false }))
       .catch(
         (error) => live && setState({ loading: false, error: error.message }),
-      );
+      )
+      .finally(() => { if (live) loadingRef.current = false; });
     return () => {
       live = false;
+      loadingRef.current = false;
     };
   }, [path, tick]);
-  return { ...state, reload: () => setTick((x) => x + 1) };
+  return { ...state, reload: () => { if (!loadingRef.current) setTick((x) => x + 1); } };
 }
 const Loading = () => <div className="dense-empty">Loading evidence…</div>;
 const DateCell = ({
@@ -1002,16 +1006,21 @@ function LegacyDiscovery() {
   );
 }
 
+export function countdownSeconds(deadlineAt:string|undefined,fallback:number,now=Date.now()):number{
+  const deadline=deadlineAt?Date.parse(deadlineAt):Number.NaN;
+  return Number.isFinite(deadline)?Math.max(0,Math.ceil((deadline-now)/1000)):Math.max(0,Math.ceil(fallback));
+}
 function Discovery(){
-  const durations=[5,10,20,30] as const,[durationMinutes,setDurationMinutes]=useState<number>(10),[active,setActive]=useState<string>(),[startError,setStartError]=useState<string>(),[enrichmentStarting,setEnrichmentStarting]=useState(false),[enrichmentMessage,setEnrichmentMessage]=useState<string>(),[manualUrl,setManualUrl]=useState(""),[manualLoading,setManualLoading]=useState(false),[manualError,setManualError]=useState<string>(),[manualResult,setManualResult]=useState<any>();
+  const durations=[5,10,20,30] as const,[durationMinutes,setDurationMinutes]=useState<number>(10),[active,setActive]=useState<string>(),[startError,setStartError]=useState<string>(),[enrichmentStarting,setEnrichmentStarting]=useState(false),[enrichmentMessage,setEnrichmentMessage]=useState<string>(),[manualUrl,setManualUrl]=useState(""),[manualLoading,setManualLoading]=useState(false),[manualError,setManualError]=useState<string>(),[manualResult,setManualResult]=useState<any>(),[clockNow,setClockNow]=useState(Date.now());
   const preview=useData<any>(`/api/v1/discovery/plan?durationMinutes=${durationMinutes}`),history=useData<any>("/api/v1/discovery/runs"),activeCheck=useData<any>("/api/v1/discovery/active"),enrichment=useData<any>("/api/v1/enrichment/queue"),run=useData<any>(active?`/api/v1/discovery/runs/${active}`:"/api/v1/discovery/runs/none");
   useEffect(()=>{if(activeCheck.data?.id)setActive(activeCheck.data.id)},[activeCheck.data?.id]);
   useEffect(()=>{if(!active)return;const timer=setInterval(run.reload,1000);if(run.data&&["completed","partial","interrupted","failed"].includes(run.data.status)){clearInterval(timer);history.reload();setActive(undefined)}return()=>clearInterval(timer)},[active,run.data?.status]);
+  useEffect(()=>{if(!active)return;setClockNow(Date.now());const timer=setInterval(()=>setClockNow(Date.now()),1000);return()=>clearInterval(timer)},[active]);
   useEffect(()=>{const timer=setInterval(enrichment.reload,5000);return()=>clearInterval(timer)},[]);
   const start=async()=>{setStartError(undefined);try{const result=await api<any>("/api/v1/discovery",{method:"POST",body:JSON.stringify({durationMinutes})});setActive(result.id)}catch(error){if(error instanceof ApiError&&error.status===409&&error.data?.activeRun?.id){setActive(error.data.activeRun.id);return}setStartError(error instanceof Error?error.message:String(error))}};
   const runDueEnrichment=async()=>{setEnrichmentStarting(true);setEnrichmentMessage(undefined);try{const result=await api<any>("/api/v1/enrichment/queue/process",{method:"POST"});setEnrichmentMessage(result.status==="scheduled"?`Starting ${result.eligibleCount} due description${result.eligibleCount===1?"":"s"}.`:result.status==="running"?"Description enrichment is already running.":result.status==="waiting"?"Nothing is due yet; automatic retry remains scheduled.":"No description work is due.");await enrichment.reload()}catch(error){setEnrichmentMessage(error instanceof Error?error.message:String(error))}finally{setEnrichmentStarting(false)}};
   const addManual=async(event:React.FormEvent)=>{event.preventDefault();setManualLoading(true);setManualError(undefined);setManualResult(undefined);try{const result=await api<any>("/api/v1/discovery/manual",{method:"POST",body:JSON.stringify({url:manualUrl,saveToPipeline:true})});setManualResult(result);setManualUrl("");history.reload()}catch(error){setManualError(error instanceof Error?error.message:String(error))}finally{setManualLoading(false)}};
-  const forecast=preview.data?.forecast,adaptive=run.data?.adaptive,remaining=Number(adaptive?.remainingSeconds??0),totalSeconds=Math.max(1,Number(adaptive?.durationMinutes??durationMinutes)*60),elapsed=Math.max(0,totalSeconds-remaining);
+  const forecast=preview.data?.forecast,adaptive=run.data?.adaptive,remaining=countdownSeconds(adaptive?.deadlineAt,Number(adaptive?.remainingSeconds??0),clockNow),totalSeconds=Math.max(1,Number(adaptive?.durationMinutes??durationMinutes)*60),elapsed=Math.max(0,totalSeconds-remaining);
   return <Page eyebrow="Adaptive collection" title="Discovery" actions={<button className="primary" disabled={!!active||preview.loading} onClick={start}>Start {durationMinutes}-minute discovery</button>}>
     <div className={`enrichment-status ${enrichment.data?.runnerStatus?.state??"loading"}`}><div className="enrichment-status-head"><span className="enrichment-live-dot"/><div><strong>Description enrichment</strong><p>{enrichment.data?.runnerStatus?.state??"loading"} · {enrichment.data?.summary?.eligibleNow??0} ready · {enrichment.data?.summary?.coolingDown??0} cooling down</p></div><button onClick={runDueEnrichment} disabled={enrichmentStarting||!!active||enrichment.data?.runnerStatus?.state==="running"||enrichment.data?.runnerStatus?.state==="paused"||!(enrichment.data?.summary?.eligibleNow>0)}>{enrichmentStarting?"Starting...":"Run due now"}</button></div>{enrichmentMessage&&<p className="enrichment-message">{enrichmentMessage}</p>}</div>
     <section className="evidence-section adaptive-plan">
@@ -1025,7 +1034,7 @@ function Discovery(){
       {startError&&<div className="error">{startError}</div>}
       {active&&<div className="adaptive-active">
         <div className="run-status"><span className="phase-label">{run.data?.phase??"starting"}</span><strong>{run.data?.phase_message??"Starting adaptive scheduler…"}</strong><small>{adaptive?.currentConcurrency??4} adaptive workers · deadline {adaptive?.deadlineAt?new Date(adaptive.deadlineAt).toLocaleTimeString("en-NL",{hour:"2-digit",minute:"2-digit"}):"calculating"}</small></div>
-        <div className="adaptive-clock"><strong>{Math.floor(remaining/60)}:{String(remaining%60).padStart(2,"0")}</strong><span>{run.data?.phase==="draining"?"Draining active work":"remaining"}</span></div>
+        <div className="adaptive-clock"><strong>{Math.floor(remaining/60)}:{String(remaining%60).padStart(2,"0")}</strong><span>{run.data?.phase==="draining"||remaining===0?"Draining active work":"remaining"}</span></div>
         <progress value={elapsed} max={totalSeconds}/><button onClick={()=>api(`/api/v1/discovery/runs/${active}/cancel`,{method:"POST"})}>Cancel safely</button>
         <div className="run-composition"><span><b>{run.data?.new_strong_count??0}</b> new strong matches</span><span><b>{run.data?.useful_match_count??0}</b> reward-eligible matches</span><span><b>{run.data?.recent_7_count??0}</b> 0–7 days</span><span><b>{run.data?.recent_30_count??0}</b> 8–30 days</span><span><b>{run.data?.recent_60_count??0}</b> 31–60 days</span><span><b>{run.data?.unknown_date_count??0}</b> unknown date, zero reward</span><span><b>{Number(run.data?.weighted_reward??0).toFixed(1)}</b> weighted reward</span><span><b>{run.data?.processed_count??0}</b> processed</span></div>
         <section className="worker-section"><h3>Active workers</h3><div className="worker-grid">{(run.data?.active_tasks??[]).map((task:any)=><article key={task.candidate_id}><div><span>{task.worker_id}</span><b>{String(task.stage).replaceAll("-"," ")}</b></div><strong>{task.job_title||task.company}</strong><small>{task.source_id} · {task.provider||"feed"}</small><p>{task.detail}</p></article>)}</div></section>

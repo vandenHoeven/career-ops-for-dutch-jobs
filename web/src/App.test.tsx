@@ -3,9 +3,17 @@ import { renderToString } from "react-dom/server";
 import { createRoot } from "react-dom/client";
 import { act } from "react";
 import { MemoryRouter } from "react-router-dom";
-import App from "./AppV2";
+import App,{countdownSeconds} from "./AppV2";
 
 const preview={durationMinutes:10,durations:[5,10,20,30],deadlinePolicy:"Stop launching at the selected time; drain active work for up to 30 seconds.",objective:{weights:{"0-7":1,"8-30":.4,"31-60":.1,unknown:0}},forecast:{expectedUsefulMatches:{point:3.2,lower:1,upper:7},confidence:"experimental",warnings:["Evidence is still sparse."],arms:[{armId:"feed:linkedin-guest:embedded",label:"LinkedIn Guest",reason:"Strong recent-match efficiency",evidence:"limited",expectedRewardPerMinute:1.25}]},sources:[]};
+
+describe("discovery countdown",()=>{
+  it("keeps moving from the deadline when the API fallback is stale",()=>{
+    const deadline="2026-11-16T15:30:00.000Z";
+    expect(countdownSeconds(deadline,1473,Date.parse("2026-11-16T15:05:27.000Z"))).toBe(1473);
+    expect(countdownSeconds(deadline,1473,Date.parse("2026-11-16T15:05:28.000Z"))).toBe(1472);
+  });
+});
 const response=(value:any,status=200)=>Promise.resolve({ok:status>=200&&status<300,status,json:()=>Promise.resolve(value)});
 
 describe("dashboard routes",()=>{
