@@ -63,7 +63,7 @@ export function linkedInKeywordsFromProfile(profile:ProfileConfig):string{
  return terms.map(term=>term.includes(' ')?`"${term}"`:term).join(' OR ');
 }
 export function createLinkedInGuestSource(options:LinkedInGuestOptions):DiscoverySource{
- const location=options.location??'Netherlands',maxPerCall=Math.max(1,Math.min(options.maxPerCall??50,50));let profileKeywords:string|undefined,freshSampled=false;
+ const location=options.location??'Netherlands',maxPerCall=Math.max(1,Math.min(options.maxPerCall??50,50));let profileKeywords:string|undefined,firstPull=true;
  return {id:SOURCE_ID,label:'LinkedIn Guest (EXPERIMENTAL)',license:'Unofficial guest HTML; live collection requires LinkedIn permission',kind:'job-feed',experimental:true,async discover(context,cursor,limit){
   if(!options.allowLiveCollection)throw new Error('LinkedIn Guest live collection is disabled; confirm permission before enabling it');
   const keywords=options.keywords??(profileKeywords??=linkedInKeywordsFromProfile(await loadProfile()));if(!keywords)throw new Error('CareerOps profile has no role-family search terms');
@@ -81,9 +81,10 @@ export function createLinkedInGuestSource(options:LinkedInGuestOptions):Discover
    offset+=selected.length;count-=selected.length;if(cards.length<10||!selected.length)break;
    }return offset;
   };
-  let continuation=Math.max(0,cursor),fresh=0;
-  if(!freshSampled){fresh=Math.min(10,wanted);await collect(0,fresh);freshSampled=true;}
-  const remaining=wanted-jobs.size;if(remaining>0)continuation=await collect(Math.max(continuation,fresh),remaining);
+  // Every run starts at the newest page. Later pulls continue from the
+  // returned offset, so a freshness sample does not exhaust the source.
+  let continuation=firstPull?0:Math.max(0,cursor);firstPull=false;
+  continuation=await collect(continuation,wanted);
   return {candidates:[...jobs.values()].map(candidate),nextCursor:continuation};
  }};
 }

@@ -51,6 +51,27 @@ test("run outcomes separate new strong matches from reward-eligible matches",()=
   }finally{store.close();rmSync(dir,{recursive:true,force:true});}
 });
 
+test("a later observation cannot erase new and strong run attribution",()=>{
+  const dir=mkdtempSync(join(tmpdir(),"diego-adaptive-monotonic-")),store=new Store(join(dir,"test.sqlite"));
+  try{store.claimTimedDiscoveryRun("run",300_000);const candidate={sourceId:"jobspy-indeed",company:"Example",provider:"browser" as const,searchArmId:"jobspy:indeed:test"},posted=new Date(Date.now()-2*86_400_000).toISOString();
+    store.recordDiscoveryOutcome("run","job",candidate,posted,{isNew:true,matchState:"strong"});
+    store.recordDiscoveryOutcome("run","job",candidate,undefined,{isNew:false,matchState:"strong"});
+    const outcome=store.db.prepare("SELECT is_new,new_strong,reward FROM discovery_outcomes WHERE run_id='run' AND job_id='job'").get() as any,row=store.db.prepare("SELECT new_strong_count,useful_match_count,weighted_reward FROM discovery_runs WHERE id='run'").get() as any;
+    assert.deepEqual({...outcome},{is_new:1,new_strong:1,reward:1});assert.deepEqual({...row},{new_strong_count:1,useful_match_count:1,weighted_reward:1});
+  }finally{store.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+test("source ranking charges downstream candidate processing time",()=>{
+  const dir=mkdtempSync(join(tmpdir(),"diego-adaptive-cost-")),store=new Store(join(dir,"test.sqlite"));
+  try{store.claimTimedDiscoveryRun("run",300_000);const now=new Date().toISOString();
+    for(const sourceId of ["fast","slow"]){store.recordDiscoveryPull({runId:"run",armId:`source:${sourceId}`,sourceId,label:sourceId,startedAt:now,durationMs:10,cursor:0,requested:10,returned:10,eligible:10});store.recordDiscoveryOutcome("run",`${sourceId}-job`,{sourceId,company:sourceId},new Date(Date.now()-86_400_000).toISOString(),{isNew:true,matchState:"strong"});}
+    const insert=store.db.prepare("INSERT INTO discovery_attempts(run_id,source_id,company,started_at,duration_ms,result,retryable,jobs_fetched,netherlands_jobs,profile_matches,candidate_json) VALUES(?,?,?,?,?,'matched',0,1,1,1,?)");
+    insert.run("run","fast","Fast",now,1_000,JSON.stringify({sourceId:"fast",company:"Fast"}));insert.run("run","slow","Slow",now,60_000,JSON.stringify({sourceId:"slow",company:"Slow"}));
+    const ranks=store.adaptiveArmRanking([{id:"fast",label:"Fast"},{id:"slow",label:"Slow"}]),fast=ranks.find((row:any)=>row.sourceId==="fast"),slow=ranks.find((row:any)=>row.sourceId==="slow");
+    assert.ok(fast.expectedRewardPerMinute>slow.expectedRewardPerMinute);assert.ok(fast.workerMs<slow.workerMs);
+  }finally{store.close();rmSync(dir,{recursive:true,force:true});}
+});
+
 test("adaptive discovery does not repeat a JobSpy search arm inside its cooldown",async()=>{
   const dir=mkdtempSync(join(tmpdir(),"diego-adaptive-cooldown-")),store=new Store(join(dir,"test.sqlite")),arm={id:"jobspy:indeed:one",label:"indeed · Netherlands · data",metadata:{query:"data",location:"Netherlands"}};let called=0;
   const source:DiscoverySource={id:"jobspy-indeed",label:"JobSpy indeed",license:"fixture",kind:"job-feed",listArms:async()=>[arm],discoverArm:async()=>{called++;return {candidates:[],nextCursor:1,total:1,arm}},discover:async()=>({candidates:[],nextCursor:1,total:1})};

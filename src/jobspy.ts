@@ -156,7 +156,9 @@ export function createJobSpySource(options: JobSpySourceOptions): DiscoverySourc
   };
   const runArm=async(_context:FetchContext,arm:DiscoverySourceArm,limit:number):Promise<DiscoveryBatch>=>{
     const query=String(arm.metadata?.query??''),location=String(arm.metadata?.location??options.location??'Netherlands'),kind=String(arm.metadata?.kind??'national-role'),armLimit=kind==='preferred-city'?positiveInteger(options.maxPerCity,10,25):positiveInteger(options.maxPerSearch,15,50),resultsWanted=Math.min(Math.max(limit,1),armLimit);
-    const jobs=deduplicate(await runJobSpy({...options,query,location,resultsWanted,hoursOld:options.hoursOld??720})).jobs;
+    // Daily discovery defaults to one week so repeated runs do not spend most
+    // of their budget rediscovering a full month of already-known postings.
+    const jobs=deduplicate(await runJobSpy({...options,query,location,resultsWanted,hoursOld:options.hoursOld??168})).jobs;
     const candidates=jobs.map(job=>candidate(options.site,{...job,raw:{...(job.raw as object),searches:[{query,location,kind}]}},arm));
     return {candidates,nextCursor:0,total:candidates.length,arm,exhaustedReason:candidates.length?undefined:'no-results'};
   };

@@ -294,6 +294,11 @@ function destinationHost(candidate: DiscoveryCandidate): string {
     return candidate.sourceId;
   }
 }
+function schedulingProvider(candidate: DiscoveryCandidate): string {
+  // Embedded feed records do not consume their nominal `browser` provider at
+  // processing time. Keep each feed isolated from slow ATS/browser boards.
+  return candidate.jobs ? `feed:${candidate.sourceId}` : candidate.provider ?? "embedded";
+}
 function hostLimit(candidate: DiscoveryCandidate): number {
   return candidate.provider === "workday" || candidate.provider === "ashby"
     ? 1
@@ -390,7 +395,7 @@ export async function discoveryPlanForUi(store:Store,limit:number,mode:Discovery
  for(const site of requested.filter(site=>(JOBSPY_SITES as readonly string[]).includes(site))){const id=`jobspy-${site}`;if(!sources.some(source=>source.id===id))plan.sources.push({id,label:`JobSpy ${site}`,kind:'job-feed',category:'jobspy',planned:0,enabled:false,status:process.env.DIEGO_ENABLE_JOBSPY==='true'?'unauthorized':'disabled'});}
  const terms=linkedInKeywordsFromProfile(profile).split(/\s+OR\s+/).map(value=>value.replace(/^"|"$/g,''));
  const explicitQueries=process.env.DIEGO_JOBSPY_QUERIES?.split(';').map(value=>value.trim()).filter(Boolean),explicitQuery=process.env.DIEGO_JOBSPY_QUERY?.trim();
- plan.scope={linkedin:{location:process.env.DIEGO_LINKEDIN_GUEST_LOCATION??'Netherlands',terms,strategy:'Up to 10 newest results, then saved continuation.'},jobspy:{platforms:sources.filter(source=>source.id.startsWith('jobspy-')).map(source=>source.id.slice(7)),location:process.env.DIEGO_JOBSPY_LOCATION??'Netherlands',preferredCities:(process.env.DIEGO_JOBSPY_PREFERRED_CITIES?.split(';').map(value=>value.trim()).filter(Boolean)??jobSpyPreferredCitiesFromProfile(profile)),queries:explicitQueries?.length?explicitQueries:explicitQuery?[explicitQuery]:jobSpyQueriesFromProfile(profile),broadQuery:explicitQuery??jobSpyQueryFromProfile(profile),hoursOld:Number(process.env.DIEGO_JOBSPY_HOURS_OLD)||undefined,version:JOBSPY_VERSION}};
+ plan.scope={linkedin:{location:process.env.DIEGO_LINKEDIN_GUEST_LOCATION??'Netherlands',terms,strategy:'Start with 25 newest results, then paginate continuously.'},jobspy:{platforms:sources.filter(source=>source.id.startsWith('jobspy-')).map(source=>source.id.slice(7)),location:process.env.DIEGO_JOBSPY_LOCATION??'Netherlands',preferredCities:(process.env.DIEGO_JOBSPY_PREFERRED_CITIES?.split(';').map(value=>value.trim()).filter(Boolean)??jobSpyPreferredCitiesFromProfile(profile)),queries:explicitQueries?.length?explicitQueries:explicitQuery?[explicitQuery]:jobSpyQueriesFromProfile(profile),broadQuery:explicitQuery??jobSpyQueryFromProfile(profile),hoursOld:Number(process.env.DIEGO_JOBSPY_HOURS_OLD)||168,version:JOBSPY_VERSION}};
  return plan;
 }
 export async function adaptiveDiscoveryPreview(store:Store,durationMinutes:unknown){
@@ -496,7 +501,7 @@ export async function discover(
   const prior = options.resume
     ? store.incompleteDiscoveryRun(options.source)
     : null;
-  const mode:DiscoveryRunMode=adaptive?"adaptive":prior?validateDiscoveryMode(prior.row.mode):validateDiscoveryMode(options.mode),concurrency = adaptive?4:prior ? Math.min(Math.max(Number(prior.row.worker_count??4),1),8) : mode==="turbo"?8:validateDiscoveryWorkers(options.concurrency);
+  const mode:DiscoveryRunMode=adaptive?"adaptive":prior?validateDiscoveryMode(prior.row.mode):validateDiscoveryMode(options.mode),concurrency = adaptive?6:prior ? Math.min(Math.max(Number(prior.row.worker_count??4),1),8) : mode==="turbo"?8:validateDiscoveryWorkers(options.concurrency);
   const configuredSources=options.sources??(mode==="refresh-known"?refreshKnownSources(store):options.source?getDiscoverySources(options.source):prioritySources(store,getDiscoverySources()));
   const requestedPlan=!adaptive&&!options.sources&&!options.source?(mode==="turbo"?buildTurboDiscoveryPlan(limit,configuredSources,store):buildDiscoveryPlan(limit,configuredSources,mode==="refresh-known"?{linkedin:0,jobspy:0,priority:limit,native:0,directories:0}:options.allocations,store,mode==="balanced"||mode==="fresh")):undefined;
   const id = prior?.id ?? options.runId ?? randomUUID(),
@@ -512,6 +517,7 @@ export async function discover(
     }
   } else if(!options.claimedRun)store.resumeDiscoveryRun(id);
   store.recordDiscoveryEvent(id,{phase:"planning",type:prior?"run-resumed":"run-started",message:prior?`Resumed ${mode} discovery with its persisted queue`:adaptive?`Started adaptive discovery for ${durationMinutes} minutes`:`Started ${mode} discovery with a budget of ${limit}`});
+  if(adaptive)store.recordDiscoveryEvent(id,{phase:"planning",type:"adaptive-sources-configured",message:`Configured ${configuredSources.length} sources, including ${configuredSources.filter(source=>source.id==='linkedin-guest'||source.id.startsWith('jobspy-')).map(source=>source.label).join(', ')||'no targeted job feeds'}`,metadata:{sourceIds:configuredSources.map(source=>source.id),targetedSourceIds:configuredSources.filter(source=>source.id==='linkedin-guest'||source.id.startsWith('jobspy-')).map(source=>source.id)}});
   const traceContext=new AsyncLocalStorage<{sourceId?:string;candidateId?:string;workerId?:string;phase:string}>();
   const context =
     options.context ??
@@ -605,12 +611,15 @@ export async function discover(
     const pullAdaptive=async():Promise<Array<{ordinal:number;candidateId:string;candidate:DiscoveryCandidate}>>=>{
       if(!adaptive||Date.now()>=deadlineAt||adaptiveExhausted.size>=configuredSources.length)return [];
       const ranking=store.adaptiveArmRanking(configuredSources.map(source=>({id:source.id,label:source.label}))),rankBySource=new Map(ranking.map((row:any)=>[row.sourceId,row])),armChoice=new Map<string,{arm:DiscoverySourceArm;rank:any}>(),now=Date.now();
-      for(const source of configuredSources){const arms=adaptiveArmsBySource.get(source.id);if(!arms?.length)continue;const ranked=store.adaptiveSearchArmRanking(source.id,arms),available=ranked.filter((row:any)=>!adaptivePulledArms.has(row.armId)&&(!row.lastAt||now-Date.parse(row.lastAt)>=30*60_000));if(available[0]){const arm=arms.find(value=>value.id===available[0].armId);if(arm)armChoice.set(source.id,{arm,rank:available[0]});}else{adaptiveExhausted.add(source.id);const cooling=ranked.some((row:any)=>!adaptivePulledArms.has(row.armId)&&row.lastAt&&now-Date.parse(row.lastAt)<30*60_000);store.recordDiscoveryEvent(id,{phase:"querying-sources",type:"adaptive-source-exhausted",sourceId:source.id,message:cooling?`${source.label}: all remaining searches are cooling down`:`${source.label}: all search arms were queried`,metadata:{reason:cooling?'cooling-down':'all-arms-queried',armCount:arms.length}});}}
+      for(const source of configuredSources){if(adaptiveExhausted.has(source.id))continue;const arms=adaptiveArmsBySource.get(source.id);if(!arms?.length)continue;const ranked=store.adaptiveSearchArmRanking(source.id,arms),available=ranked.filter((row:any)=>!adaptivePulledArms.has(row.armId)&&(!row.lastAt||now-Date.parse(row.lastAt)>=30*60_000));if(available[0]){const arm=arms.find(value=>value.id===available[0].armId);if(arm)armChoice.set(source.id,{arm,rank:available[0]});}else{adaptiveExhausted.add(source.id);const cooling=ranked.some((row:any)=>!adaptivePulledArms.has(row.armId)&&row.lastAt&&now-Date.parse(row.lastAt)<30*60_000);store.recordDiscoveryEvent(id,{phase:"querying-sources",type:"adaptive-source-exhausted",sourceId:source.id,message:cooling?`${source.label}: all remaining searches are cooling down`:`${source.label}: all search arms were queried`,metadata:{reason:cooling?'cooling-down':'all-arms-queried',armCount:arms.length}});}}
       const source=[...configuredSources].filter(row=>!adaptiveExhausted.has(row.id)).sort((a,b)=>{
+        const minimumPulls=(source:DiscoverySource)=>source.id==='linkedin-guest'||source.id.startsWith('jobspy-')?3:0,aPulls=adaptivePullCounts.get(a.id)??0,bPulls=adaptivePullCounts.get(b.id)??0,aUnderMinimum=aPulls<minimumPulls(a),bUnderMinimum=bPulls<minimumPulls(b);
+        if(aUnderMinimum!==bUnderMinimum)return aUnderMinimum?-1:1;
+        if(aUnderMinimum&&bUnderMinimum&&aPulls!==bPulls)return aPulls-bPulls;
         const ar:any=armChoice.get(a.id)?.rank??rankBySource.get(a.id),br:any=armChoice.get(b.id)?.rank??rankBySource.get(b.id),as=(Number(ar?.score??0)+.001)/(1+(adaptivePullCounts.get(a.id)??0)),bs=(Number(br?.score??0)+.001)/(1+(adaptivePullCounts.get(b.id)??0));return bs-as||a.id.localeCompare(b.id);
       })[0];
       if(!source)return [];
-      const cursor=adaptiveCursors.get(source.id)??0,request=10,pullStarted=Date.now(),startedAt=new Date().toISOString(),choice=armChoice.get(source.id),selectionRank=choice?.rank??rankBySource.get(source.id);store.registerDiscoverySource(source);adaptivePullCounts.set(source.id,(adaptivePullCounts.get(source.id)??0)+1);
+      const cursor=adaptiveCursors.get(source.id)??0,request=source.id==='linkedin-guest'?25:source.id.startsWith('jobspy-')?20:10,pullStarted=Date.now(),startedAt=new Date().toISOString(),choice=armChoice.get(source.id),selectionRank=choice?.rank??rankBySource.get(source.id);store.registerDiscoverySource(source);adaptivePullCounts.set(source.id,(adaptivePullCounts.get(source.id)??0)+1);
       try{
         store.updateDiscoveryPhase(id,"querying-sources",`Adaptive pull from ${choice?.arm.label??source.label}`);store.recordDiscoveryEvent(id,{phase:"querying-sources",type:"adaptive-source-selected",sourceId:source.id,cursor,message:`Selected ${choice?.arm.label??source.label} using measured v2 efficiency and exploration confidence`,metadata:{priorityScore:selectionRank?.score??0,expectedRewardPerMinute:selectionRank?.expectedRewardPerMinute??0,duplicatePenalty:selectionRank?.duplicates??0,evidence:selectionRank?.evidence??'sparse',searchArm:choice?.arm.metadata}});
         const batch=await bounded(Math.min(timeoutMs,Math.max(1000,deadlineAt-Date.now())),controller.signal,active=>choice&&source.discoverArm?source.discoverArm(signaledContext(context,active),choice.arm,request):source.discover(signaledContext(context,active),cursor,request));
@@ -651,7 +660,9 @@ export async function discover(
       store.updateRecallCheckpoint(id,counts);
       progress(`${counts.processed} processed | ${counts.employers} employers | ${counts.newJobs} new jobs | ${counts.errors} errors`);
     };
-    const waiting=[...queue],active=new Set<Promise<any>>(),hostUse=new Map<string,number>(),providerUse=new Map<string,number>(),availableSlots=Array.from({length:adaptive?8:concurrency},(_,index)=>index+1),adaptiveRecentFailures:boolean[]=[];let currentConcurrency=concurrency;
+    const waiting=[...queue],active=new Set<Promise<any>>(),hostUse=new Map<string,number>(),providerUse=new Map<string,number>(),availableSlots=Array.from({length:adaptive?8:concurrency},(_,index)=>index+1),providerRecentFailures=new Map<string,boolean[]>(),adaptiveProviderLimits=new Map<string,number>();let currentConcurrency=concurrency;
+    const baseProviderLimit=(provider:string)=>provider==="workday"||provider==="ashby"?2:currentConcurrency;
+    const providerLimit=(provider:string)=>adaptive?adaptiveProviderLimits.get(provider)??baseProviderLimit(provider):baseProviderLimit(provider);
     const executeCandidate=(item:typeof queue[number],workerId:string):Promise<any>=>{
           const { candidateId: idValue } = item,
             startedAt = new Date().toISOString(),
@@ -776,8 +787,9 @@ export async function discover(
             if(employerId)for(const job of jobs){
               const needsEnrichment=(job.description?.trim().length??0)<160;
               const processed=processJob(job,{store,profile,sourceId:candidate.sourceId,provider:candidate.provider??'browser',scanId,discoveryRunId:id,candidateId:idValue,boardUrl:candidate.boardUrl,candidate:normalizedCandidate,employerId,enrichmentStatus:needsEnrichment?'pending':'not-needed'});
-              if(isNetherlandsJob(processed.job,profile)){store.observeVacancy(employerId,candidate.sourceId,processed.job,fingerprint(processed.job),processed.decision.retain);if(adaptive)store.recordDiscoveryOutcome(id,processed.id,normalizedCandidate,processed.job.postedAt,{isNew:processed.write==='new',matchState:processed.decision.matchState});}
-              if(processed.decision.retain){matches++;processed.write==='new'?newJobs++:refreshedJobs++;if(needsEnrichment){counts.descriptionCandidates++;counts.deferredEnrichments++;}if(processed.decision.evidence?.matchedFrom==='description')counts.descriptionMatches++;}
+              const netherlands=isNetherlandsJob(processed.job,profile);
+              if(netherlands){store.observeVacancy(employerId,candidate.sourceId,processed.job,fingerprint(processed.job),processed.decision.retain);if(adaptive)store.recordDiscoveryOutcome(id,processed.id,normalizedCandidate,processed.job.postedAt,{isNew:processed.write==='new',matchState:processed.decision.matchState});}
+              if(netherlands&&processed.decision.retain){matches++;processed.write==='new'?newJobs++:refreshedJobs++;if(needsEnrichment){counts.descriptionCandidates++;counts.deferredEnrichments++;}if(processed.decision.evidence?.matchedFrom==='description')counts.descriptionMatches++;}
               else counts.nonmatching++;
             }
             if(collection && candidate.boardUrl && !candidate.jobs){
@@ -791,8 +803,8 @@ export async function discover(
             store.markDiscoveryQueue(id, idValue, "completed", result);
           });
           if (["network-error", "rate-limited", "timeout"].includes(result))
-            {circuit.set(key, (circuit.get(key) ?? 0) + 1);providerCircuit.set(candidate.provider??"embedded",(providerCircuit.get(candidate.provider??"embedded")??0)+1);}
-          else {circuit.set(key, 0);providerCircuit.set(candidate.provider??"embedded",0);}
+            {const provider=schedulingProvider(candidate);circuit.set(key, (circuit.get(key) ?? 0) + 1);providerCircuit.set(provider,(providerCircuit.get(provider)??0)+1);}
+          else {circuit.set(key, 0);providerCircuit.set(schedulingProvider(candidate),0);}
           const outcome = {
             result,
             retryable,
@@ -809,7 +821,7 @@ export async function discover(
           }finally{store.finishDiscoveryTask(id,idValue);}});
     };
     const circuitAllows=(item:{candidate:DiscoveryCandidate})=>{
-      const key=destinationHost(item.candidate),provider=item.candidate.provider??"embedded";
+      const key=destinationHost(item.candidate),provider=schedulingProvider(item.candidate);
       return (circuit.get(key)??0)<5&&(providerCircuit.get(provider)??0)<5;
     };
     while((active.size||(!adaptive&&waiting.length)||(adaptive&&Date.now()<deadlineAt&&(waiting.length||adaptiveExhausted.size<configuredSources.length)))&&!controller.signal.aborted){
@@ -818,18 +830,18 @@ export async function discover(
       let launched=false;
       if(adaptive){const candidateScores=new Map(waiting.map(item=>[item.candidateId,store.adaptiveCandidateScore(item.candidate)]));waiting.sort((a,b)=>(candidateScores.get(b.candidateId)??0)-(candidateScores.get(a.candidateId)??0)||a.ordinal-b.ordinal);}
       while(active.size<currentConcurrency&&availableSlots.length&&(!adaptive||Date.now()<deadlineAt)){
-        const index=waiting.findIndex(item=>{const key=destinationHost(item.candidate),provider=item.candidate.provider??"embedded",providerLimit=provider==="workday"||provider==="ashby"?2:concurrency;return (circuit.get(key)??0)<5&&(providerCircuit.get(provider)??0)<5&&(hostUse.get(key)??0)<hostLimit(item.candidate)&&(providerUse.get(provider)??0)<providerLimit;});
+        const index=waiting.findIndex(item=>{const key=destinationHost(item.candidate),provider=schedulingProvider(item.candidate);return (circuit.get(key)??0)<5&&(providerCircuit.get(provider)??0)<5&&(hostUse.get(key)??0)<hostLimit(item.candidate)&&(providerUse.get(provider)??0)<providerLimit(provider);});
         if(index<0)break;
-        const [item]=waiting.splice(index,1),key=destinationHost(item.candidate),provider=item.candidate.provider??"embedded",slot=availableSlots.shift()!,promise=executeCandidate(item,`worker-${slot}`);
+        const [item]=waiting.splice(index,1),key=destinationHost(item.candidate),provider=schedulingProvider(item.candidate),slot=availableSlots.shift()!,promise=executeCandidate(item,`worker-${slot}`);
         hostUse.set(key,(hostUse.get(key)??0)+1);providerUse.set(provider,(providerUse.get(provider)??0)+1);active.add(promise);launched=true;
-        const release=(outcome?:any)=>{hostUse.set(key,Math.max(0,(hostUse.get(key)??1)-1));providerUse.set(provider,Math.max(0,(providerUse.get(provider)??1)-1));active.delete(promise);availableSlots.push(slot);if(adaptive&&outcome){adaptiveRecentFailures.push(operationalFailures.has(outcome.result));if(adaptiveRecentFailures.length>20)adaptiveRecentFailures.shift();const rate=adaptiveRecentFailures.filter(Boolean).length/adaptiveRecentFailures.length;if(rate>.2)currentConcurrency=Math.max(2,currentConcurrency-2);else if(counts.processed>0&&counts.processed%5===0&&rate<.1)currentConcurrency=Math.min(8,currentConcurrency+1);store.db.prepare("UPDATE discovery_runs SET current_concurrency=?,worker_count=? WHERE id=?").run(currentConcurrency,currentConcurrency,id);}};
+        const release=(outcome?:any)=>{hostUse.set(key,Math.max(0,(hostUse.get(key)??1)-1));providerUse.set(provider,Math.max(0,(providerUse.get(provider)??1)-1));active.delete(promise);availableSlots.push(slot);if(adaptive&&outcome){const recent=providerRecentFailures.get(provider)??[];recent.push(operationalFailures.has(outcome.result));if(recent.length>20)recent.shift();providerRecentFailures.set(provider,recent);const rate=recent.filter(Boolean).length/recent.length,priorLimit=providerLimit(provider),maximum=baseProviderLimit(provider),nextLimit=rate>.2?Math.max(1,priorLimit-1):recent.length>=5&&rate<.1?Math.min(maximum,priorLimit+1):priorLimit;if(nextLimit!==priorLimit){adaptiveProviderLimits.set(provider,nextLimit);store.recordDiscoveryEvent(id,{phase:"processing",type:"provider-concurrency-adjusted",level:nextLimit<priorLimit?"error":"info",message:`${provider} concurrency ${nextLimit<priorLimit?'reduced':'increased'} from ${priorLimit} to ${nextLimit}`,metadata:{provider,priorLimit,nextLimit,recentFailureRate:rate,sampleSize:recent.length}});}store.db.prepare("UPDATE discovery_runs SET current_concurrency=?,worker_count=? WHERE id=?").run(currentConcurrency,currentConcurrency,id);}};
         void promise.then(release,()=>release());
       }
       if(active.size){if(adaptive&&Date.now()>=drainDeadlineAt){controller.abort(new Error("Discovery drain deadline reached"));break;}await Promise.race(active);}
       else if(!launched){
         for(const [provider,failures] of providerCircuit)if(failures>=5&&!reportedProviderCircuits.has(provider)){
           reportedProviderCircuits.add(provider);
-          store.recordDiscoveryEvent(id,{phase:"processing",type:"provider-circuit-open",level:"error",message:`${provider} paused after ${failures} consecutive transient failures`,metadata:{provider,failures,pending:waiting.filter(item=>(item.candidate.provider??"embedded")===provider).length}});
+          store.recordDiscoveryEvent(id,{phase:"processing",type:"provider-circuit-open",level:"error",message:`${provider} paused after ${failures} consecutive transient failures`,metadata:{provider,failures,pending:waiting.filter(item=>schedulingProvider(item.candidate)===provider).length}});
         }
         if(adaptive&&Date.now()<deadlineAt&&adaptiveExhausted.size<configuredSources.length){
           // A provider circuit can leave queued candidates temporarily

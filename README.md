@@ -171,7 +171,9 @@ Live collection is registered only when both
 explicit acknowledgement that appropriate permission has been obtained. Search
 keywords are derived from the configured CareerOps role families by default;
 keywords and location can be overridden with `DIEGO_LINKEDIN_GUEST_KEYWORDS`
-and `DIEGO_LINKEDIN_GUEST_LOCATION`. No LinkedIn source is shown or queried
+and `DIEGO_LINKEDIN_GUEST_LOCATION`. Timed discovery starts with the 25 newest
+results and then continues through later pages while useful capacity remains.
+No LinkedIn source is shown or queried
 without these opt-ins.
 
 JobSpy is an optional multi-board discovery layer and is also excluded by
@@ -182,9 +184,10 @@ default. Install the pinned CLI with `py -m pip install -r requirements-jobspy.t
 such as `DIEGO_JOBSPY_INDEED_PERMISSION_CONFIRMED=true`; selected boards without
 that flag are neither registered nor invoked. `DIEGO_JOBSPY_COMMAND` can point
 to the virtual environment's `jobspy` executable. Focused role/city searches
-are separate adaptive arms: one meaningful batch is collected per pull, arms
-rotate between runs, and recently repeated arms cool down before reuse. The
-default freshness window is 30 days. Optional bounds are
+are separate adaptive arms: one meaningful batch is collected per pull, every
+enabled platform receives baseline coverage before broad directories, and
+recently repeated arms cool down before reuse. The default freshness window is
+7 days. Optional bounds are
 `DIEGO_JOBSPY_TIMEOUT_MS`, `DIEGO_JOBSPY_MAX_PER_SEARCH` (default 15),
 `DIEGO_JOBSPY_MAX_PER_CITY` (default 10), and
 `DIEGO_JOBSPY_MAX_PER_PLATFORM` (default 100, hard cap 200). Set
