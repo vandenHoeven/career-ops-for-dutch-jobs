@@ -10,13 +10,18 @@ import {
   useParams,
 } from "react-router-dom";
 import LegacyApp from "./App";
-import { api, ApiError, date } from "./api";
+import { api, ApiError, applicationStageMeta, date, stageLabel, stages } from "./api";
 import "./dense.css";
 import "./action-column.css";
 import LocationSettings from "./LocationSettings";
 import "./location-settings.css";
 import { EmployerDetail, EmployersPage } from "./EmployerIntelligence";
 import { SourceDetail, SourcesPage } from "./SourceIntelligence";
+import {
+  DiscoveryRunningBanner,
+  DiscoveryStatusProvider,
+  useDiscoveryStatus,
+} from "./DiscoveryStatus";
 
 type Job = Record<string, any>;
 const navigation = [
@@ -53,7 +58,10 @@ function Shell({ children }: { children: ReactNode }) {
           Local & private
         </div>
       </aside>
-      <main>{children}</main>
+      <main>
+        <DiscoveryRunningBanner />
+        {children}
+      </main>
       <div className="mobile-nav">
         {navigation.slice(0, 6).map(([to, label, icon]) => (
           <NavLink key={to} to={to} end={to === "/"}>
@@ -234,7 +242,7 @@ function JobTable({
                 <small>{job.provider}</small>
               </td>
               {!compact && (
-                <><td><span className={`review-badge ${job.review_state}`}>{job.review_state}</span></td><td>{job.application_stage?<span className="state-badge">{job.application_stage}</span>:<span className="unknown">Not started</span>}</td></>
+                <><td><span className={`review-badge ${job.review_state}`}>{job.review_state}</span></td><td>{job.application_stage?<span className="state-badge">{stageLabel(job.application_stage)}</span>:<span className="unknown">Not started</span>}</td></>
               )}
               <td>
                 <div className="row-actions">
@@ -268,7 +276,7 @@ function Jobs() {
     q=params.get("q")??"",matchState=params.get("matchState")??"",role=params.get("roleFamily")??"",provider=params.get("provider")??"",work=params.get("workArrangement")??"",locationAccess=params.get("locationAccess")??"",sort=params.get("sort")??"score",view=params.get("view")??"new",reviewStates=(params.get("reviewState")??"").split(",").filter(Boolean),applicationStages=(params.get("applicationStage")??"").split(",").filter(Boolean),size=params.get("size")??"50",page=Number(params.get("page")??0);
   const [selected,setSelected]=useState<Set<string>>(()=>new Set(JSON.parse(sessionStorage.getItem("jobs:selected")??"[]"))),[loaded,setLoaded]=useState(Number(sessionStorage.getItem("jobs:loaded")??50));
   const update=(values:Record<string,string>,keepPage=false)=>{const next=new URLSearchParams(location.search);Object.entries(values).forEach(([key,value])=>value?next.set(key,value):next.delete(key));if(!keepPage)next.delete("page");setSelected(new Set());setLoaded(50);navigate(`/jobs?${next}`)};
-  const viewDefaults:Record<string,Record<string,string>>={new:{reviewState:"new",applicationStage:"",status:"active"},saved:{reviewState:"",applicationStage:"saved,preparing",status:""},submitted:{reviewState:"",applicationStage:"applied,screening,interview,assessment,offer",status:""},declined:{reviewState:"declined",applicationStage:"",status:""},active:{reviewState:"new,reviewed",applicationStage:"",status:"active"},expired:{reviewState:"",applicationStage:"",status:"expired"}};
+  const viewDefaults:Record<string,Record<string,string>>={new:{reviewState:"new",applicationStage:"",status:"active"},saved:{reviewState:"",applicationStage:"saved,preparing",status:""},submitted:{reviewState:"",applicationStage:"applied,screening,interview,second_interview,assessment,offer,hired",status:""},declined:{reviewState:"declined",applicationStage:"",status:""},active:{reviewState:"new,reviewed",applicationStage:"",status:"active"},expired:{reviewState:"",applicationStage:"",status:"expired"}};
   const chooseView=(name:string)=>{const next=new URLSearchParams();next.set("view",name);Object.entries(viewDefaults[name]).forEach(([k,v])=>v&&next.set(k,v));next.set("size",size);navigate(`/jobs?${next}`);setSelected(new Set());setLoaded(50)};
   const limit=size==="continuous"?loaded:Number(size),offset=size==="continuous"?0:page*limit;
   const query=new URLSearchParams(location.search);query.delete("view");query.delete("size");query.delete("page");query.set("matchState",matchState||"all");query.set("eligibility",["excluded","all"].includes(matchState)?"all":"eligible");query.set("limit",String(limit));query.set("offset",String(offset));
@@ -336,7 +344,7 @@ function Jobs() {
           <option value="company">Company A–Z</option>
         </select>
         <details className="multi-filter"><summary>Review state ({reviewStates.length||"all"})</summary>{["new","reviewed","declined","archived"].map(value=><label key={value}><input type="checkbox" checked={reviewStates.includes(value)} onChange={()=>toggle("reviewState",value,reviewStates)}/>{value}</label>)}</details>
-        <details className="multi-filter"><summary>Application ({applicationStages.length||"all"})</summary>{["saved","preparing","applied","screening","interview","assessment","offer","hired","rejected","withdrawn"].map(value=><label key={value}><input type="checkbox" checked={applicationStages.includes(value)} onChange={()=>toggle("applicationStage",value,applicationStages)}/>{value}</label>)}</details>
+        <details className="multi-filter"><summary>Application ({applicationStages.length||"all"})</summary>{applicationStageMeta.map(stage=><label key={stage.value}><input type="checkbox" checked={applicationStages.includes(stage.value)} onChange={()=>toggle("applicationStage",stage.value,applicationStages)}/>{stage.label}</label>)}</details>
         <select aria-label="Rows per page" value={size} onChange={e=>update({size:e.target.value})}><option>25</option><option>50</option><option>100</option><option>250</option><option value="continuous">Continuous scroll</option></select>
       </div>
       <div className="bulk-bar"><span>{selected.size} selected</span><button disabled={!selected.size} onClick={()=>bulk("save")}>Save</button><button disabled={!selected.size} onClick={()=>bulk("reviewed")}>Reviewed</button><button disabled={!selected.size} onClick={()=>bulk("declined")}>Decline</button><button disabled={!selected.size} onClick={()=>bulk("archived")}>Archive</button></div>
@@ -457,10 +465,21 @@ function Ledger({ ledger }: { ledger: any }) {
   );
 }
 
-const applicationStages=["saved","preparing","applied","screening","interview","assessment","offer","hired","rejected","withdrawn"];
-const stageGroups=[{key:"interested",label:"Interested",stages:["saved","preparing"]},{key:"applied",label:"Applied",stages:["applied","screening"]},{key:"interviewing",label:"Interviewing",stages:["interview","assessment"]},{key:"offer",label:"Offer",stages:["offer"]},{key:"closed",label:"Closed",stages:["hired","rejected","withdrawn"]}];
-const firstStage:Record<string,string>={interested:"saved",applied:"applied",interviewing:"interview",offer:"offer",closed:"withdrawn"};
-const stageRank=(stage:string)=>applicationStages.indexOf(stage);
+const applicationStages=stages;
+const stageGroups:{key:string;label:string;stages:string[];dropStage:string;closed?:boolean}[]=[
+  {key:"saved",label:"Saved",stages:["saved"],dropStage:"saved"},
+  {key:"preparing",label:"Preparing",stages:["preparing"],dropStage:"preparing"},
+  {key:"applied",label:"Applied",stages:["applied"],dropStage:"applied"},
+  {key:"screening",label:"Screening",stages:["screening"],dropStage:"screening"},
+  {key:"interview",label:"First interview",stages:["interview"],dropStage:"interview"},
+  {key:"second_interview",label:"Second interview",stages:["second_interview"],dropStage:"second_interview"},
+  {key:"assessment",label:"Assessment",stages:["assessment"],dropStage:"assessment"},
+  {key:"offer",label:"Offer",stages:["offer","hired"],dropStage:"offer"},
+  {key:"rejected",label:"Rejected",stages:["rejected"],dropStage:"rejected",closed:true},
+  {key:"withdrawn",label:"Withdrawn",stages:["withdrawn"],dropStage:"withdrawn",closed:true},
+];
+const stageRank=(stage:string)=>applicationStages.findIndex(value=>value===stage);
+const stageOptions=applicationStageMeta.map(stage=><option key={stage.value} value={stage.value}>{stage.label}</option>);
 
 function ApplicationWorkspace({job,reload}:{job:Job;reload:()=>void}){
   const current=job.application,[notes,setNotes]=useState(current?.notes??""),[appliedAt,setAppliedAt]=useState(current?.applied_at?.slice(0,10)??""),[followUp,setFollowUp]=useState(current?.next_follow_up_at?.slice(0,10)??""),[saveState,setSaveState]=useState("Saved"),[category,setCategory]=useState("cv"),[label,setLabel]=useState(""),[uploading,setUploading]=useState(false);
@@ -470,21 +489,29 @@ function ApplicationWorkspace({job,reload}:{job:Job;reload:()=>void}){
   const upload=async(file?:File)=>{if(!file)return;if(file.size>25*1024*1024){alert("File exceeds the 25 MB limit");return}setUploading(true);try{const query=new URLSearchParams({category,label});await api(`/api/v1/jobs/${job.id}/application/documents?${query}`,{method:"POST",headers:{"content-type":file.type||"application/octet-stream","x-file-name":encodeURIComponent(file.name)},body:file});reload()}catch(error:any){alert(error.message)}finally{setUploading(false)}};
   const remove=async(id:string)=>{if(!confirm("Permanently delete this local file? This cannot be undone."))return;await api(`/api/v1/application-documents/${id}`,{method:"DELETE"});reload()};
   return <section className="application-workspace evidence-section"><div className="section-heading"><div><p>Application workspace</p><h2>Track what you submitted</h2></div><span className={`save-state ${saveState.startsWith("Error")?"error":""}`}>{saveState}</span></div>
-    <div className="application-fields"><label>Exact stage<select value={current?.stage??"saved"} onChange={e=>changeStage(e.target.value)}>{applicationStages.map(stage=><option key={stage}>{stage}</option>)}</select></label><label>Applied date<input type="date" value={appliedAt} onChange={e=>setAppliedAt(e.target.value)} onBlur={()=>save({appliedAt:appliedAt||null})}/></label><label>Next follow-up<input type="date" value={followUp} onChange={e=>setFollowUp(e.target.value)} onBlur={()=>save({nextFollowUpAt:followUp||null})}/></label></div>
+    <div className="application-fields"><label>Exact stage<select value={current?.stage??"saved"} onChange={e=>changeStage(e.target.value)}>{stageOptions}</select></label><label>Applied date<input type="date" value={appliedAt} onChange={e=>setAppliedAt(e.target.value)} onBlur={()=>save({appliedAt:appliedAt||null})}/></label><label>Next follow-up<input type="date" value={followUp} onChange={e=>setFollowUp(e.target.value)} onBlur={()=>save({nextFollowUpAt:followUp||null})}/></label></div>
     <label className="notes-field">Notes<textarea value={notes} placeholder="Contacts, preparation notes, status…" onChange={e=>setNotes(e.target.value)} onBlur={()=>save({notes})}/></label>
     <div className="documents-head"><div><h3>Submitted documents</h3><p>PDF, DOCX, or TXT · up to 25 MB · previous versions are retained</p></div><select value={category} onChange={e=>setCategory(e.target.value)}><option value="cv">CV</option><option value="motivation">Motivation letter</option><option value="other">Other</option></select><input aria-label="Document label" placeholder="Version label (optional)" value={label} onChange={e=>setLabel(e.target.value)}/><label className="button">{uploading?"Uploading…":"Upload file"}<input hidden type="file" accept=".pdf,.docx,.txt" disabled={uploading} onChange={e=>upload(e.target.files?.[0])}/></label></div>
     <div className="document-list">{job.documents?.map((doc:any)=><article key={doc.id}><div><strong>{doc.original_name}</strong><small>{doc.category}{doc.label?` · ${doc.label}`:""} · {(doc.size_bytes/1024).toFixed(0)} KB · {date(doc.created_at)}</small></div><a href={`/api/v1/application-documents/${doc.id}`}>Download</a><button onClick={()=>remove(doc.id)}>Delete</button></article>)}{!job.documents?.length&&<p className="unknown">No submitted files stored yet.</p>}</div>
-    {!!job.transitions?.length&&<details className="stage-history"><summary>Stage history ({job.transitions.length})</summary>{job.transitions.map((item:any)=><p key={item.id}><b>{item.from_stage||"Started"} → {item.to_stage}</b><span>{date(item.occurred_at)}</span></p>)}</details>}
+    {!!job.transitions?.length&&<details className="stage-history"><summary>Stage history ({job.transitions.length})</summary>{job.transitions.map((item:any)=><p key={item.id}><b>{item.from_stage?stageLabel(item.from_stage):"Started"} → {stageLabel(item.to_stage)}</b><span>{date(item.occurred_at)}</span></p>)}</details>}
   </section>
 }
 
 function Applications(){
-  const state=useData<any>("/api/v1/applications"),[layout,setLayout]=useState<"kanban"|"table">("kanban"),[q,setQ]=useState(""),[scope,setScope]=useState("all"),[closedOpen,setClosedOpen]=useState(false);
-  const items=(state.data?.items??[]).filter((item:any)=>(!q||`${item.title} ${item.company}`.toLowerCase().includes(q.toLowerCase()))&&(scope==="all"||(scope==="to-apply"?["saved","preparing"].includes(item.stage):["applied","screening","interview","assessment","offer"].includes(item.stage))));
-  const move=async(item:any,stage:string)=>{if(stageRank(stage)<stageRank(item.stage)&&!confirm(`Move ${item.title} back from ${item.stage} to ${stage}?`))return;await api(`/api/v1/jobs/${item.job_id}/application`,{method:"PATCH",body:JSON.stringify({stage})});state.reload()};
+  const state=useData<any>("/api/v1/applications"),[layout,setLayout]=useState<"kanban"|"table">("kanban"),[q,setQ]=useState(""),[scope,setScope]=useState("all"),[collapsed,setCollapsed]=useState<Record<string,boolean>>(()=>{try{return JSON.parse(localStorage.getItem("application-closed-columns")??"{}")}catch{return {}}});
+  useEffect(()=>{try{localStorage.setItem("application-closed-columns",JSON.stringify(collapsed))}catch{}},[collapsed]);
+  const items=(state.data?.items??[]).filter((item:any)=>(!q||`${item.title} ${item.company}`.toLowerCase().includes(q.toLowerCase()))&&(scope==="all"||(scope==="to-apply"?["saved","preparing"].includes(item.stage):["applied","screening","interview","second_interview","assessment","offer","hired"].includes(item.stage))));
+  const move=async(item:any,stage:string)=>{if(stageRank(stage)<stageRank(item.stage)&&!confirm(`Move ${item.title} back from ${stageLabel(item.stage)} to ${stageLabel(stage)}?`))return;await api(`/api/v1/jobs/${item.job_id}/application`,{method:"PATCH",body:JSON.stringify({stage})});state.reload()};
+  const toggleColumn=(key:string)=>setCollapsed(value=>({...value,[key]:!value[key]}));
   return <Page eyebrow="Application pipeline" title="Applications" actions={<div className="layout-switch"><button className={layout==="kanban"?"active":""} onClick={()=>setLayout("kanban")}>Board</button><button className={layout==="table"?"active":""} onClick={()=>setLayout("table")}>Table</button></div>}>
     <div className="application-filters"><input placeholder="Search applications…" value={q} onChange={e=>setQ(e.target.value)}/><button className={scope==="all"?"active":""} onClick={()=>setScope("all")}>All</button><button className={scope==="to-apply"?"active":""} onClick={()=>setScope("to-apply")}>To apply</button><button className={scope==="submitted"?"active":""} onClick={()=>setScope("submitted")}>Submitted</button></div>
-    {state.loading?<Loading/>:state.error?<div className="error">{state.error}</div>:layout==="kanban"?<div className="kanban">{stageGroups.map(group=><section className={group.key==="closed"?"closed":""} key={group.key} onDragOver={e=>e.preventDefault()} onDrop={e=>{const item=items.find((x:any)=>x.job_id===e.dataTransfer.getData("text/job"));if(item)void move(item,firstStage[group.key])}}><header><h2>{group.label}</h2><span>{items.filter((x:any)=>group.stages.includes(x.stage)).length}</span></header><div>{items.filter((x:any)=>group.stages.includes(x.stage)).map((item:any)=><article className="application-card" draggable onDragStart={e=>e.dataTransfer.setData("text/job",item.job_id)} key={item.job_id}><Link to={`/jobs/${item.job_id}`}><strong>{item.title}</strong><span>{item.company}</span></Link><div><span className="state-badge">{item.stage}</span><Score job={item}/></div><dl><dt>Applied</dt><dd>{date(item.applied_at)}</dd><dt>Follow-up</dt><dd>{date(item.next_follow_up_at)}</dd><dt>Documents</dt><dd>{item.document_count}</dd></dl><select aria-label={`Exact stage for ${item.title}`} value={item.stage} onChange={e=>move(item,e.target.value)}>{applicationStages.map(stage=><option key={stage}>{stage}</option>)}</select></article>)}</div></section>)}</div>:<div className="application-table"><table><thead><tr><th>Role</th><th>Stage</th><th>Score</th><th>Applied</th><th>Follow-up</th><th>Documents</th><th>Updated</th></tr></thead><tbody>{items.map((item:any)=><tr key={item.job_id}><td><Link to={`/jobs/${item.job_id}`}><strong>{item.title}</strong><small>{item.company}</small></Link></td><td><select value={item.stage} onChange={e=>move(item,e.target.value)}>{applicationStages.map(stage=><option key={stage}>{stage}</option>)}</select></td><td>{item.overall_score??"—"}</td><td>{date(item.applied_at)}</td><td>{date(item.next_follow_up_at)}</td><td>{item.document_count}</td><td>{date(item.updated_at)}</td></tr>)}</tbody></table></div>}
+    {state.loading?<Loading/>:state.error?<div className="error">{state.error}</div>:layout==="kanban"?<div className="kanban">{stageGroups.map(group=>{
+      const groupItems=items.filter((item:any)=>group.stages.includes(item.stage)),isCollapsed=Boolean(group.closed&&collapsed[group.key]);
+      return <section className={`${group.closed?"closed ":""}${isCollapsed?"collapsed":""}`} key={group.key} data-stage={group.key} onDragOver={e=>e.preventDefault()} onDrop={e=>{const item=items.find((x:any)=>x.job_id===e.dataTransfer.getData("text/job"));if(item)void move(item,group.dropStage)}}>
+        <header><h2>{group.label}</h2><span>{groupItems.length}</span>{group.closed&&<button type="button" title={`${isCollapsed?"Expand":"Collapse"} ${group.label}`} aria-label={`${isCollapsed?"Expand":"Collapse"} ${group.label}`} onClick={()=>toggleColumn(group.key)}>{isCollapsed?"›":"‹"}</button>}</header>
+        <div>{groupItems.map((item:any)=><article className="application-card" draggable onDragStart={e=>e.dataTransfer.setData("text/job",item.job_id)} key={item.job_id}><Link to={`/jobs/${item.job_id}`}><strong>{item.title}</strong><span>{item.company}</span></Link><div><span className={`state-badge stage-${item.stage}`}>{stageLabel(item.stage)}</span><Score job={item}/></div><dl><dt>Applied</dt><dd>{date(item.applied_at)}</dd><dt>Follow-up</dt><dd>{date(item.next_follow_up_at)}</dd><dt>Documents</dt><dd>{item.document_count}</dd></dl><select aria-label={`Exact stage for ${item.title}`} value={item.stage} onChange={e=>move(item,e.target.value)}>{stageOptions}</select></article>)}</div>
+      </section>
+    })}</div>:<div className="application-table"><table><thead><tr><th>Role</th><th>Stage</th><th>Score</th><th>Applied</th><th>Follow-up</th><th>Documents</th><th>Updated</th></tr></thead><tbody>{items.map((item:any)=><tr key={item.job_id}><td><Link to={`/jobs/${item.job_id}`}><strong>{item.title}</strong><small>{item.company}</small></Link></td><td><select value={item.stage} onChange={e=>move(item,e.target.value)}>{stageOptions}</select></td><td>{item.overall_score??"—"}</td><td>{date(item.applied_at)}</td><td>{date(item.next_follow_up_at)}</td><td>{item.document_count}</td><td>{date(item.updated_at)}</td></tr>)}</tbody></table></div>}
   </Page>
 }
 
@@ -551,7 +578,7 @@ function JobDetail() {
         </a>
       </div>
       <ApplicationWorkspace job={j} reload={job.reload}/>
-      {j.application&&<section className="application-activity evidence-section"><div className="section-heading"><div><p>Application trace</p><h2>Status history</h2></div><span className="state-badge">Current: {j.application.stage}</span></div><div className="application-timeline">{j.transitions?.map((item:any,index:number)=><article key={item.id}><i/><div><strong>{item.to_stage}</strong><p>{item.from_stage?`Changed from ${item.from_stage}`:"Application tracking started"}</p><time>{new Date(item.occurred_at).toLocaleString("en-NL",{dateStyle:"medium",timeStyle:"short"})}</time>{index===0&&<span>Current status</span>}</div></article>)}</div></section>}
+      {j.application&&<section className="application-activity evidence-section"><div className="section-heading"><div><p>Application trace</p><h2>Status history</h2></div><span className="state-badge">Current: {stageLabel(j.application.stage)}</span></div><div className="application-timeline">{j.transitions?.map((item:any,index:number)=><article key={item.id}><i/><div><strong>{stageLabel(item.to_stage)}</strong><p>{item.from_stage?`Changed from ${stageLabel(item.from_stage)}`:"Application tracking started"}</p><time>{new Date(item.occurred_at).toLocaleString("en-NL",{dateStyle:"medium",timeStyle:"short"})}</time>{index===0&&<span>Current status</span>}</div></article>)}</div></section>}
       <DecisionHistory id={id!}/><p>{JSON.parse(j.uncertainty_reasons_json??'[]').map(reasonLabel).join(' · ')}</p><section className="evidence-section">
         <div className="section-heading">
           <div><p>{j.match_state==='possible'?'Possible match ? evidence needs review':'Qualification evidence'}</p><h2>Why this job entered the ranked list</h2></div>
@@ -731,7 +758,7 @@ function Overview() {
 }
 
 function Inbox({title,eyebrow,items,href,empty}:{title:string;eyebrow:string;items:Job[];href:string;empty:string}){
-  return <section className="inbox-section"><header><div><p>{eyebrow}</p><h2>{title}</h2></div><Link to={href}>View all →</Link></header><div>{items.map(job=><Link className="inbox-row" key={job.id} to={`/jobs/${job.id}`}><Score job={job}/><span><strong>{job.title}</strong><small>{job.company} · {job.application_stage??job.review_state}</small></span><b>›</b></Link>)}{!items.length&&<p className="inbox-empty">{empty}</p>}</div></section>
+  return <section className="inbox-section"><header><div><p>{eyebrow}</p><h2>{title}</h2></div><Link to={href}>View all →</Link></header><div>{items.map(job=><Link className="inbox-row" key={job.id} to={`/jobs/${job.id}`}><Score job={job}/><span><strong>{job.title}</strong><small>{job.company} · {job.application_stage?stageLabel(job.application_stage):job.review_state}</small></span><b>›</b></Link>)}{!items.length&&<p className="inbox-empty">{empty}</p>}</div></section>
 }
 
 function RunList({ runs }: { runs: any[] }) {
@@ -1011,16 +1038,17 @@ export function countdownSeconds(deadlineAt:string|undefined,fallback:number,now
   return Number.isFinite(deadline)?Math.max(0,Math.ceil((deadline-now)/1000)):Math.max(0,Math.ceil(fallback));
 }
 function Discovery(){
-  const durations=[5,10,20,30] as const,[durationMinutes,setDurationMinutes]=useState<number>(10),[active,setActive]=useState<string>(),[startError,setStartError]=useState<string>(),[enrichmentStarting,setEnrichmentStarting]=useState(false),[enrichmentMessage,setEnrichmentMessage]=useState<string>(),[manualUrl,setManualUrl]=useState(""),[manualLoading,setManualLoading]=useState(false),[manualError,setManualError]=useState<string>(),[manualResult,setManualResult]=useState<any>(),[clockNow,setClockNow]=useState(Date.now());
-  const preview=useData<any>(`/api/v1/discovery/plan?durationMinutes=${durationMinutes}`),history=useData<any>("/api/v1/discovery/runs"),activeCheck=useData<any>("/api/v1/discovery/active"),enrichment=useData<any>("/api/v1/enrichment/queue"),run=useData<any>(active?`/api/v1/discovery/runs/${active}`:"/api/v1/discovery/runs/none");
-  useEffect(()=>{if(activeCheck.data?.id)setActive(activeCheck.data.id)},[activeCheck.data?.id]);
-  useEffect(()=>{if(!active)return;const timer=setInterval(run.reload,1000);if(run.data&&["completed","partial","interrupted","failed"].includes(run.data.status)){clearInterval(timer);history.reload();setActive(undefined)}return()=>clearInterval(timer)},[active,run.data?.status]);
+  const durations=[5,10,20,30] as const,[durationMinutes,setDurationMinutes]=useState<number>(10),[startError,setStartError]=useState<string>(),[enrichmentStarting,setEnrichmentStarting]=useState(false),[enrichmentMessage,setEnrichmentMessage]=useState<string>(),[manualUrl,setManualUrl]=useState(""),[manualLoading,setManualLoading]=useState(false),[manualError,setManualError]=useState<string>(),[manualResult,setManualResult]=useState<any>(),[clockNow,setClockNow]=useState(Date.now());
+  const {activeRun,announceStarted}=useDiscoveryStatus(),active=activeRun?.id,lastActiveId=useRef<string|undefined>(undefined);
+  const preview=useData<any>(`/api/v1/discovery/plan?durationMinutes=${durationMinutes}`),history=useData<any>("/api/v1/discovery/runs"),enrichment=useData<any>("/api/v1/enrichment/queue"),run=useData<any>(active?`/api/v1/discovery/runs/${active}`:"/api/v1/discovery/runs/none"),activeDetail=run.data?.id===active?run.data:activeRun;
+  useEffect(()=>{if(active){lastActiveId.current=active;return}if(lastActiveId.current){lastActiveId.current=undefined;history.reload();enrichment.reload()}},[active]);
+  useEffect(()=>{if(!active)return;const timer=setInterval(run.reload,2000);return()=>clearInterval(timer)},[active]);
   useEffect(()=>{if(!active)return;setClockNow(Date.now());const timer=setInterval(()=>setClockNow(Date.now()),1000);return()=>clearInterval(timer)},[active]);
   useEffect(()=>{const timer=setInterval(enrichment.reload,5000);return()=>clearInterval(timer)},[]);
-  const start=async()=>{setStartError(undefined);try{const result=await api<any>("/api/v1/discovery",{method:"POST",body:JSON.stringify({durationMinutes})});setActive(result.id)}catch(error){if(error instanceof ApiError&&error.status===409&&error.data?.activeRun?.id){setActive(error.data.activeRun.id);return}setStartError(error instanceof Error?error.message:String(error))}};
+  const start=async()=>{setStartError(undefined);try{const result=await api<any>("/api/v1/discovery",{method:"POST",body:JSON.stringify({durationMinutes})});announceStarted(result)}catch(error){if(error instanceof ApiError&&error.status===409&&error.data?.activeRun?.id){announceStarted(error.data.activeRun);return}setStartError(error instanceof Error?error.message:String(error))}};
   const runDueEnrichment=async()=>{setEnrichmentStarting(true);setEnrichmentMessage(undefined);try{const result=await api<any>("/api/v1/enrichment/queue/process",{method:"POST"});setEnrichmentMessage(result.status==="scheduled"?`Starting ${result.eligibleCount} due description${result.eligibleCount===1?"":"s"}.`:result.status==="running"?"Description enrichment is already running.":result.status==="waiting"?"Nothing is due yet; automatic retry remains scheduled.":"No description work is due.");await enrichment.reload()}catch(error){setEnrichmentMessage(error instanceof Error?error.message:String(error))}finally{setEnrichmentStarting(false)}};
   const addManual=async(event:React.FormEvent)=>{event.preventDefault();setManualLoading(true);setManualError(undefined);setManualResult(undefined);try{const result=await api<any>("/api/v1/discovery/manual",{method:"POST",body:JSON.stringify({url:manualUrl,saveToPipeline:true})});setManualResult(result);setManualUrl("");history.reload()}catch(error){setManualError(error instanceof Error?error.message:String(error))}finally{setManualLoading(false)}};
-  const forecast=preview.data?.forecast,adaptive=run.data?.adaptive,remaining=countdownSeconds(adaptive?.deadlineAt,Number(adaptive?.remainingSeconds??0),clockNow),totalSeconds=Math.max(1,Number(adaptive?.durationMinutes??durationMinutes)*60),elapsed=Math.max(0,totalSeconds-remaining);
+  const forecast=preview.data?.forecast,adaptive=activeDetail?.adaptive,remaining=countdownSeconds(adaptive?.deadlineAt,Number(adaptive?.remainingSeconds??0),clockNow),totalSeconds=Math.max(1,Number(adaptive?.durationMinutes??durationMinutes)*60),elapsed=Math.max(0,totalSeconds-remaining);
   return <Page eyebrow="Adaptive collection" title="Discovery" actions={<button className="primary" disabled={!!active||preview.loading} onClick={start}>Start {durationMinutes}-minute discovery</button>}>
     <div className={`enrichment-status ${enrichment.data?.runnerStatus?.state??"loading"}`}><div className="enrichment-status-head"><span className="enrichment-live-dot"/><div><strong>Description enrichment</strong><p>{enrichment.data?.runnerStatus?.state??"loading"} · {enrichment.data?.summary?.eligibleNow??0} ready · {enrichment.data?.summary?.coolingDown??0} cooling down</p></div><button onClick={runDueEnrichment} disabled={enrichmentStarting||!!active||enrichment.data?.runnerStatus?.state==="running"||enrichment.data?.runnerStatus?.state==="paused"||!(enrichment.data?.summary?.eligibleNow>0)}>{enrichmentStarting?"Starting...":"Run due now"}</button></div>{enrichmentMessage&&<p className="enrichment-message">{enrichmentMessage}</p>}</div>
     <section className="evidence-section adaptive-plan">
@@ -1033,11 +1061,11 @@ function Discovery(){
       </>}
       {startError&&<div className="error">{startError}</div>}
       {active&&<div className="adaptive-active">
-        <div className="run-status"><span className="phase-label">{run.data?.phase??"starting"}</span><strong>{run.data?.phase_message??"Starting adaptive scheduler…"}</strong><small>{adaptive?.currentConcurrency??4} adaptive workers · deadline {adaptive?.deadlineAt?new Date(adaptive.deadlineAt).toLocaleTimeString("en-NL",{hour:"2-digit",minute:"2-digit"}):"calculating"}</small></div>
-        <div className="adaptive-clock"><strong>{Math.floor(remaining/60)}:{String(remaining%60).padStart(2,"0")}</strong><span>{run.data?.phase==="draining"||remaining===0?"Draining active work":"remaining"}</span></div>
+        <div className="run-status"><span className="phase-label">{activeDetail?.phase??"starting"}</span><strong>{activeDetail?.phase_message??"Starting adaptive scheduler…"}</strong><small>{adaptive?.currentConcurrency??4} adaptive workers · deadline {adaptive?.deadlineAt?new Date(adaptive.deadlineAt).toLocaleTimeString("en-NL",{hour:"2-digit",minute:"2-digit"}):"calculating"}</small></div>
+        <div className="adaptive-clock"><strong>{Math.floor(remaining/60)}:{String(remaining%60).padStart(2,"0")}</strong><span>{activeDetail?.phase==="draining"||remaining===0?"Draining active work":"remaining"}</span></div>
         <progress value={elapsed} max={totalSeconds}/><button onClick={()=>api(`/api/v1/discovery/runs/${active}/cancel`,{method:"POST"})}>Cancel safely</button>
-        <div className="run-composition"><span><b>{run.data?.new_strong_count??0}</b> new strong matches</span><span><b>{run.data?.useful_match_count??0}</b> reward-eligible matches</span><span><b>{run.data?.recent_7_count??0}</b> 0–7 days</span><span><b>{run.data?.recent_30_count??0}</b> 8–30 days</span><span><b>{run.data?.recent_60_count??0}</b> 31–60 days</span><span><b>{run.data?.unknown_date_count??0}</b> unknown date, zero reward</span><span><b>{Number(run.data?.weighted_reward??0).toFixed(1)}</b> weighted reward</span><span><b>{run.data?.processed_count??0}</b> processed</span></div>
-        <section className="worker-section"><h3>Active workers</h3><div className="worker-grid">{(run.data?.active_tasks??[]).map((task:any)=><article key={task.candidate_id}><div><span>{task.worker_id}</span><b>{String(task.stage).replaceAll("-"," ")}</b></div><strong>{task.job_title||task.company}</strong><small>{task.source_id} · {task.provider||"feed"}</small><p>{task.detail}</p></article>)}</div></section>
+        <div className="run-composition"><span><b>{activeDetail?.new_strong_count??0}</b> new strong matches</span><span><b>{activeDetail?.useful_match_count??0}</b> reward-eligible matches</span><span><b>{activeDetail?.recent_7_count??0}</b> 0–7 days</span><span><b>{activeDetail?.recent_30_count??0}</b> 8–30 days</span><span><b>{activeDetail?.recent_60_count??0}</b> 31–60 days</span><span><b>{activeDetail?.unknown_date_count??0}</b> unknown date, zero reward</span><span><b>{Number(activeDetail?.weighted_reward??0).toFixed(1)}</b> weighted reward</span><span><b>{activeDetail?.processed_count??0}</b> processed</span></div>
+        <section className="worker-section"><h3>Active workers</h3><div className="worker-grid">{(activeDetail?.active_tasks??[]).map((task:any)=><article key={task.candidate_id}><div><span>{task.worker_id}</span><b>{String(task.stage).replaceAll("-"," ")}</b></div><strong>{task.job_title||task.company}</strong><small>{task.source_id} · {task.provider||"feed"}</small><p>{task.detail}</p></article>)}</div></section>
         <section className="adaptive-decisions"><h3>Recent scheduler decisions</h3>{(adaptive?.pulls??[]).slice(0,8).map((pull:any,index:number)=><article key={`${pull.started_at}-${index}`}><strong>{pull.label}</strong><span>{pull.returned} returned · {pull.queued_unique} uniquely queued · {pull.duplicates} true duplicates · {duration(pull.duration_ms)}</span><small>{pull.metadata?.exhaustedReason?`Status: ${String(pull.metadata.exhaustedReason).replaceAll("-"," ")} · `:""}Priority {Number(pull.metadata?.priorityScore??0).toFixed(2)} · expected {Number(pull.metadata?.expectedRewardPerMinute??0).toFixed(2)} reward/min</small></article>)}</section>
         <TechnicalTrace runId={active}/>
       </div>}
@@ -1053,6 +1081,7 @@ function Discovery(){
 
 export default function AppV2() {
   return (
+    <DiscoveryStatusProvider>
     <Routes>
       <Route
         path="/"
@@ -1136,5 +1165,6 @@ export default function AppV2() {
       />
       <Route path="*" element={<LegacyApp />} />
     </Routes>
+    </DiscoveryStatusProvider>
   );
 }

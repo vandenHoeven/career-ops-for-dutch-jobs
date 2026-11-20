@@ -72,6 +72,16 @@ test("source ranking charges downstream candidate processing time",()=>{
   }finally{store.close();rmSync(dir,{recursive:true,force:true});}
 });
 
+test("candidate scoring batches shared source history instead of repeating full rankings",()=>{
+  const dir=mkdtempSync(join(tmpdir(),"diego-adaptive-batch-")),store=new Store(join(dir,"test.sqlite"));
+  try{store.claimTimedDiscoveryRun("run",300_000);const now=new Date().toISOString(),candidates=[{sourceId:"feed",company:"One",jobs:[]},{sourceId:"feed",company:"Two",jobs:[]},{sourceId:"boards",company:"Board",boardUrl:"https://example.test/jobs",provider:"browser" as const}];
+    store.recordDiscoveryPull({runId:"run",armId:"source:feed",sourceId:"feed",label:"Feed",startedAt:now,durationMs:100,cursor:0,requested:2,returned:2,eligible:2});
+    const insert=store.db.prepare("INSERT INTO discovery_attempts(run_id,source_id,company,board_url,started_at,duration_ms,result,retryable,jobs_fetched,netherlands_jobs,profile_matches,candidate_json) VALUES(?,?,?,?,?,?,'matched',0,1,1,1,?)");insert.run("run","boards","Board","https://example.test/jobs",now,500,JSON.stringify(candidates[2]));
+    const original=store.adaptiveArmRanking.bind(store);let rankingCalls=0;(store as any).adaptiveArmRanking=(rows:any[])=>{rankingCalls++;return original(rows)};
+    const scores=store.adaptiveCandidateScores(candidates);assert.equal(scores.length,3);assert.equal(scores[0],scores[1]);assert.ok(scores.every(Number.isFinite));assert.equal(rankingCalls,1);
+  }finally{store.close();rmSync(dir,{recursive:true,force:true});}
+});
+
 test("adaptive discovery does not repeat a JobSpy search arm inside its cooldown",async()=>{
   const dir=mkdtempSync(join(tmpdir(),"diego-adaptive-cooldown-")),store=new Store(join(dir,"test.sqlite")),arm={id:"jobspy:indeed:one",label:"indeed · Netherlands · data",metadata:{query:"data",location:"Netherlands"}};let called=0;
   const source:DiscoverySource={id:"jobspy-indeed",label:"JobSpy indeed",license:"fixture",kind:"job-feed",listArms:async()=>[arm],discoverArm:async()=>{called++;return {candidates:[],nextCursor:1,total:1,arm}},discover:async()=>({candidates:[],nextCursor:1,total:1})};

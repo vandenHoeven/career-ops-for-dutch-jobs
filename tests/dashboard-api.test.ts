@@ -21,8 +21,10 @@ test("dashboard API validates review and application writes", async () => {
     const applications: any = await (await fetch(`${base}/api/v1/applications`)).json(); assert.equal(applications.items[0].stage, "preparing");
     const applied = await fetch(`${base}/api/v1/jobs/${job.id}/application`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ stage: "applied" }) });
     const appliedRecord: any = await applied.json(); assert.equal(applied.status, 200); assert.ok(appliedRecord.appliedAt, "entering a submitted stage records its date automatically");
+    const secondInterview = await fetch(`${base}/api/v1/jobs/${job.id}/application`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ stage: "second_interview" }) });
+    const secondInterviewRecord: any = await secondInterview.json(); assert.equal(secondInterview.status, 200); assert.equal(secondInterviewRecord.stage, "second_interview"); assert.equal(secondInterviewRecord.appliedAt, appliedRecord.appliedAt, "later submitted stages preserve the original applied date");
     const withdrawn = await fetch(`${base}/api/v1/jobs/${job.id}/application`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ stage: "withdrawn" }) }); assert.equal(withdrawn.status, 200);
-    const history: any = await (await fetch(`${base}/api/v1/jobs/${job.id}/application/history`)).json(); assert.equal(history.items[0].to_stage, "withdrawn"); assert.ok(history.items[0].occurred_at);
+    const history: any = await (await fetch(`${base}/api/v1/jobs/${job.id}/application/history`)).json(); assert.equal(history.items[0].to_stage, "withdrawn"); assert.equal(history.items[1].to_stage, "second_interview"); assert.ok(history.items[0].occurred_at);
     const list: any = await (await fetch(`${base}/api/v1/jobs?eligibility=all`)).json(); assert.equal(list.total, 1); assert.equal(list.items.length, 1);assert.equal(list.items[0].location_access_tier,'medium');assert.equal(list.items[0].locationAccess.matchedCity,'Amsterdam');
     const medium:any=await (await fetch(`${base}/api/v1/jobs?eligibility=all&locationAccess=medium`)).json();assert.equal(medium.total,1);
     const easy:any=await (await fetch(`${base}/api/v1/jobs?eligibility=all&locationAccess=easy`)).json();assert.equal(easy.total,0);
@@ -39,10 +41,17 @@ test("dashboard API validates review and application writes", async () => {
     const plan:any=await (await fetch(`${base}/api/v1/discovery/plan?durationMinutes=10`)).json();assert.equal(plan.durationMinutes,10);assert.match(plan.deadlinePolicy,/Stop launching/);assert.ok(plan.sources.length>0);assert.ok(plan.sources.every((row:any)=>typeof row.score==="number"));
     const invalidDuration=await fetch(`${base}/api/v1/discovery`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({durationMinutes:7})});assert.equal(invalidDuration.status,400);
     const discoveryId="aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa";store.startDiscoveryRun(discoveryId,undefined,10,undefined,"fresh");store.recordDiscoveryEvent(discoveryId,{phase:"planning",type:"run-started",message:"Fresh run started"});
+    const status:any=await (await fetch(`${base}/api/v1/discovery/status`)).json();assert.equal(status.active,true);assert.equal(status.run.id,discoveryId);assert.equal("sources" in status.run,false);
     const duplicate=await fetch(`${base}/api/v1/discovery`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({durationMinutes:10})});assert.equal(duplicate.status,409);const duplicateBody:any=await duplicate.json();assert.equal(duplicateBody.activeRun.id,discoveryId);
     const enrichment:any=await (await fetch(`${base}/api/v1/enrichment/queue`)).json();assert.equal(typeof enrichment.total,"number");assert.equal(typeof enrichment.summary.eligibleNow,"number");assert.equal(enrichment.runnerStatus.state,"paused");
     const processEnrichment=await fetch(`${base}/api/v1/enrichment/queue/process`,{method:"POST"});assert.equal(processEnrichment.status,409);assert.equal((await processEnrichment.json() as any).status,"paused");
     const run:any=await (await fetch(`${base}/api/v1/discovery/runs/${discoveryId}`)).json();assert.equal(run.mode,"fresh");assert.equal(run.phase,"planning");assert.ok("eta" in run);
     const runTrace:any=await (await fetch(`${base}/api/v1/discovery/runs/${discoveryId}/trace?after=0`)).json();assert.equal(runTrace.items[0].event_type,"run-started");
   } finally { await new Promise<void>(resolve => server.close(() => resolve())); store.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("dashboard startup recovers an orphaned discovery as interrupted",async()=>{
+  const dir=mkdtempSync(join(tmpdir(),"diego-dashboard-recovery-")),store=new Store(join(dir,"test.sqlite"));store.claimTimedDiscoveryRun("orphan",300_000);const server=createDashboardApi(store);await new Promise<void>(resolve=>server.listen(0,"127.0.0.1",resolve));const address=server.address();if(!address||typeof address==="string")throw new Error("No address");
+  try{const status:any=await (await fetch(`http://127.0.0.1:${address.port}/api/v1/discovery/status`)).json(),row=store.db.prepare("SELECT status,phase FROM discovery_runs WHERE id='orphan'").get() as any;assert.deepEqual(status,{active:false,run:null});assert.equal(row.status,"interrupted");assert.equal(row.phase,"cancelled");}
+  finally{await new Promise<void>(resolve=>server.close(()=>resolve()));store.close();rmSync(dir,{recursive:true,force:true});}
 });

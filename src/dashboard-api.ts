@@ -1,11 +1,14 @@
 import { coverageRoutes } from './diagnostics.js';
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { createHash, randomUUID } from "node:crypto";
+import { createReadStream } from "node:fs";
 import { mkdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
 import { basename, extname, resolve } from "node:path";
+import { pipeline } from "node:stream/promises";
 import { Store, type JobQuery } from "./database.js";
-import { adaptiveDiscoveryPreview, discover } from "./discovery.js";
+import { adaptiveDiscoveryPreview } from "./discovery.js";
 import { validateDiscoveryDuration } from "./adaptive-discovery.js";
+import { DiscoveryWorkerManager } from "./discovery-worker-manager.js";
 import { dataDir, loadProfile, projectRoot, saveProfile } from "./config.js";
 import { enrichJobs, rescoreJobs } from "./quality.js";
 import { aiCacheKey, aiConfig, requestAiAssessment } from "./ai-scoring.js";
@@ -15,8 +18,7 @@ import { importVacancyUrl } from "./manual-import.js";
 import { createIdleEnrichmentRunner } from "./idle-enrichment.js";
 
 const reviews = new Set<ReviewState>(["new", "reviewed", "declined", "archived"]);
-const stages = new Set<ApplicationStage>(["saved", "preparing", "applied", "screening", "interview", "assessment", "offer", "hired", "rejected", "withdrawn"]);
-const runs = new Map<string, AbortController>();
+const stages = new Set<ApplicationStage>(["saved", "preparing", "applied", "screening", "interview", "second_interview", "assessment", "offer", "hired", "rejected", "withdrawn"]);
 const mime: Record<string, string> = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml", ".png": "image/png" };
 const json = (res: ServerResponse, status: number, value: unknown) => { res.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" }); res.end(JSON.stringify(value)); };
 const num = (url: URL, key: string) => { const raw = url.searchParams.get(key); if (raw === null) return undefined; const value = Number(raw); return Number.isFinite(value) ? value : undefined; };
@@ -29,12 +31,19 @@ function jobQuery(url: URL): JobQuery { const boolean = (key: string) => url.sea
 async function asset(pathname: string, res: ServerResponse): Promise<boolean> { const root = resolve(projectRoot, "web/dist"), path = resolve(root, pathname === "/" ? "index.html" : pathname.replace(/^\/+/, "")); if (!path.startsWith(root)) return false; try { if ((await stat(path)).isDirectory()) return false; const content = await readFile(path); res.writeHead(200, { "content-type": mime[extname(path)] ?? "application/octet-stream" }); res.end(content); return true; } catch { try { const content = await readFile(resolve(root, "index.html")); res.writeHead(200, { "content-type": "text/html; charset=utf-8" }); res.end(content); return true; } catch { return false; } } }
 
 export function createDashboardApi(store = new Store()) {
-  const idleEnrichment=createIdleEnrichmentRunner(store,()=>Boolean(store.activeDiscoveryRun()));
+  store.recoverOrphanedDiscoveryRuns();
+  let open=true;
+  const idleEnrichment=createIdleEnrichmentRunner(store,()=>store.hasActiveDiscoveryRun());
+  const runner=new DiscoveryWorkerManager({
+    onUnexpectedExit:(id,message)=>store.failDiscoveryRun(id,message),
+    onForcedStop:id=>store.interruptDiscoveryRun(id),
+    onSettled:()=>{if(open)idleEnrichment.kick();},
+  });
   const server=createServer(async (req, res) => {
     try {
       const url = new URL(req.url ?? "/", "http://localhost"), method = req.method ?? "GET";
       if(await coverageRoutes(req,res,url,store,{processEnrichment:()=>{
-        if(store.activeDiscoveryRun())return {statusCode:409,body:{error:"Description enrichment is paused while discovery is active",status:"paused"}};
+        if(store.hasActiveDiscoveryRun())return {statusCode:409,body:{error:"Description enrichment is paused while discovery is active",status:"paused"}};
         const result=idleEnrichment.kick(),summary=store.enrichmentQueueSummary();
         return {statusCode:result.status==="scheduled"?202:200,body:{...result,runnerStatus:idleEnrichment.status(),summary}};
       }}))return;
@@ -50,7 +59,7 @@ export function createDashboardApi(store = new Store()) {
       if(method==="GET"&&documents){required(store,documents[1]);return json(res,200,{items:store.applicationDocuments(documents[1])});}
       if(method==="POST"&&documents){required(store,documents[1]);const category=url.searchParams.get("category")??"other",categories=new Set(["cv","motivation","other"]);if(!categories.has(category))return json(res,400,{error:"Invalid document category"});const originalName=basename(decodeURIComponent(req.headers["x-file-name"] as string||"document")),extension=extname(originalName).toLowerCase();if(![".pdf",".docx",".txt"].includes(extension))return json(res,400,{error:"Only PDF, DOCX, and TXT files are supported"});const content=await fileInput(req);if(!content.length)return json(res,400,{error:"File is empty"});const id=randomUUID(),folder=resolve(dataDir,"application-files",documents[1]);await mkdir(folder,{recursive:true});const storedName=`${id}${extension}`,absolute=resolve(folder,storedName);await writeFile(absolute,content);const value=store.addApplicationDocument({id,jobId:documents[1],category,label:url.searchParams.get("label")||undefined,originalName,storedName,mimeType:req.headers["content-type"]||"application/octet-stream",sizeBytes:content.length,checksum:createHash("sha256").update(content).digest("hex"),relativePath:`application-files/${documents[1]}/${storedName}`,submissionDate:url.searchParams.get("submissionDate")||undefined,replacesId:url.searchParams.get("replacesId")||undefined});return json(res,201,value);}
       const document = url.pathname.match(/^\/api\/v1\/application-documents\/([a-f0-9-]+)$/);
-      if(method==="GET"&&document){const row=store.applicationDocument(document[1]);if(!row)return json(res,404,{error:"Document not found"});const absolute=resolve(dataDir,row.relative_path);if(!absolute.startsWith(resolve(dataDir,"application-files")))return json(res,400,{error:"Invalid document path"});const content=await readFile(absolute);res.writeHead(200,{"content-type":row.mime_type,"content-length":content.length,"content-disposition":`attachment; filename*=UTF-8''${encodeURIComponent(row.original_name)}`});res.end(content);return;}
+      if(method==="GET"&&document){const row=store.applicationDocument(document[1]);if(!row)return json(res,404,{error:"Document not found"});const absolute=resolve(dataDir,row.relative_path);if(!absolute.startsWith(resolve(dataDir,"application-files")))return json(res,400,{error:"Invalid document path"});const file=await stat(absolute);res.writeHead(200,{"content-type":row.mime_type,"content-length":file.size,"content-disposition":`attachment; filename*=UTF-8''${encodeURIComponent(row.original_name)}`});try{await pipeline(createReadStream(absolute),res);}catch(error){res.destroy(error instanceof Error?error:undefined);}return;}
       if(method==="DELETE"&&document){const row=store.applicationDocument(document[1]);if(!row)return json(res,404,{error:"Document not found"});const absolute=resolve(dataDir,row.relative_path);if(!absolute.startsWith(resolve(dataDir,"application-files")))return json(res,400,{error:"Invalid document path"});await unlink(absolute).catch(()=>undefined);store.deleteApplicationDocument(document[1]);return json(res,200,{deleted:true});}
       const rescore = url.pathname.match(/^\/api\/v1\/jobs\/([a-f0-9]{24})\/rescore$/); if (method === "POST" && rescore) { required(store, rescore[1]); return json(res, 200, await rescoreJobs({ store, jobId: rescore[1] })); }
       const enrich = url.pathname.match(/^\/api\/v1\/jobs\/([a-f0-9]{24})\/enrich$/); if (method === "POST" && enrich) { required(store, enrich[1]); return json(res, 200, await enrichJobs({ store, jobId: enrich[1] })); }
@@ -70,28 +79,33 @@ export function createDashboardApi(store = new Store()) {
       }
       if (method === "GET" && url.pathname === "/api/v1/discovery/plan") return json(res,200,await adaptiveDiscoveryPreview(store,url.searchParams.get("durationMinutes")??10));
       if (method === "POST" && url.pathname === "/api/v1/discovery/forecast") { const body=await input(req);return json(res,200,await adaptiveDiscoveryPreview(store,body.durationMinutes)); }
+      if (method === "GET" && url.pathname === "/api/v1/discovery/status") { const run=store.activeDiscoverySummary();return json(res,200,{active:Boolean(run),run}); }
       if (method === "GET" && url.pathname === "/api/v1/discovery/active") return json(res,200,store.activeDiscoveryRun());
       if (method === "GET" && url.pathname === "/api/v1/discovery/runs") return json(res, 200, { items: store.discoveryRuns() });
       const run = url.pathname.match(/^\/api\/v1\/discovery\/runs\/([a-f0-9-]+)$/); if (method === "GET" && run) { const value = store.discoveryRun(run[1]); return value ? json(res, 200, value) : json(res, 404, { error: "Discovery run not found" }); }
       const runTrace = url.pathname.match(/^\/api\/v1\/discovery\/runs\/([a-f0-9-]+)\/trace$/); if (method === "GET" && runTrace) { const value=store.discoveryTrace(runTrace[1],num(url,"after")??0,num(url,"limit")??200);return value?json(res,200,value):json(res,404,{error:"Discovery run not found"}); }
-      const cancel = url.pathname.match(/^\/api\/v1\/discovery\/runs\/([a-f0-9-]+)\/cancel$/); if (method === "POST" && cancel) { const controller = runs.get(cancel[1]); if (!controller) return json(res, 409, { error: "Run is not active" }); controller.abort(new Error("Cancelled from dashboard")); return json(res, 202, { id: cancel[1], status: "cancelling" }); }
+      const cancel = url.pathname.match(/^\/api\/v1\/discovery\/runs\/([a-f0-9-]+)\/cancel$/); if (method === "POST" && cancel) { if (!runner.cancel(cancel[1])) return json(res, 409, { error: "Run is not active" }); return json(res, 202, { id: cancel[1], status: "cancelling" }); }
       if (method === "GET" && url.pathname === "/api/v1/discovery/failures") return json(res, 200, { items: store.discoveryFailures({ retryable: url.searchParams.has("retryable") ? url.searchParams.get("retryable") === "true" : undefined, source: url.searchParams.get("source") ?? undefined, limit: num(url, "limit"), includeMissing: url.searchParams.get("includeMissing") === "true" }) });
       if (method === "GET" && url.pathname === "/api/v1/coverage") return json(res, 200, {...(store.coverage() as any),...store.coverageTrace()});
       if (method === "GET" && url.pathname === "/api/v1/source-performance") { const type=url.searchParams.get("type")==="provider"?"provider":"discovery",window=url.searchParams.get("window")==="lifetime"?"lifetime":"30d"; return json(res,200,store.sourcePerformance(type,window)); }
-      if (method === "GET" && url.pathname === "/api/v1/enrichment/queue") {const runnerStatus=idleEnrichment.status(),activeDiscovery=Boolean(store.activeDiscoveryRun()),summary=store.enrichmentQueueSummary();return json(res,200,{items:store.enrichmentQueueCounts(),total:summary.eligibleNow+summary.coolingDown,summary,runnerStatus:{...runnerStatus,state:activeDiscovery?'paused':runnerStatus.state}});}
+      if (method === "GET" && url.pathname === "/api/v1/enrichment/queue") {const runnerStatus=idleEnrichment.status(),activeDiscovery=store.hasActiveDiscoveryRun(),summary=store.enrichmentQueueSummary();return json(res,200,{items:store.enrichmentQueueCounts(),total:summary.eligibleNow+summary.coolingDown,summary,runnerStatus:{...runnerStatus,state:activeDiscovery?'paused':runnerStatus.state}});}
       const sourcePerformance=url.pathname.match(/^\/api\/v1\/source-performance\/([^/]+)$/); if(method==="GET"&&sourcePerformance){const window=url.searchParams.get("window")==="lifetime"?"lifetime":"30d";return json(res,200,store.sourcePerformanceDetail(decodeURIComponent(sourcePerformance[1]),window));}
       if(method==="GET"&&url.pathname==="/api/v1/coverage/benchmark")return json(res,200,store.benchmarkCoverage());
       if(method==="GET"&&url.pathname==="/api/v1/coverage/overlap")return json(res,200,store.coverageOverlap(url.searchParams.get("window")==="lifetime"?"lifetime":"30d"));
-      if (method === "POST" && url.pathname === "/api/v1/discovery") { const body=await input(req),durationMinutes=validateDiscoveryDuration(body.durationMinutes);store.recoverStaleDiscoveryRuns();const id=randomUUID(),claim=store.claimTimedDiscoveryRun(id,durationMinutes*60_000);if(!claim.claimed)return json(res,409,{error:"A discovery run is already active",activeRun:claim.activeRun});idleEnrichment.pause();const controller = new AbortController(); runs.set(id, controller); void discover({ runId:id,durationMinutes,signal:controller.signal,claimedRun:true }).catch(error => console.error(`Discovery ${id} failed:`, error)).finally(() => {runs.delete(id);idleEnrichment.kick();}); return json(res,202,{id,status:"starting",mode:"adaptive",durationMinutes,deadlineAt:new Date(Date.now()+durationMinutes*60_000).toISOString()}); }
+      if (method === "POST" && url.pathname === "/api/v1/discovery") { const body=await input(req),durationMinutes=validateDiscoveryDuration(body.durationMinutes);store.recoverStaleDiscoveryRuns();const id=randomUUID(),claim=store.claimTimedDiscoveryRun(id,durationMinutes*60_000);if(!claim.claimed)return json(res,409,{error:"A discovery run is already active",activeRun:claim.activeRun});idleEnrichment.pause();try{runner.start(id,durationMinutes);}catch(error){store.failDiscoveryRun(id,error instanceof Error?error.message:String(error));idleEnrichment.kick();throw error;}return json(res,202,{id,status:"starting",mode:"adaptive",durationMinutes,deadlineAt:new Date(Date.now()+durationMinutes*60_000).toISOString()}); }
       if (url.pathname.startsWith("/api/")) return json(res, 404, { error: "Not found" });
       if (method === "GET" && await asset(url.pathname, res)) return;
       return json(res, 404, { error: "Not found" });
     } catch (error: any) { return json(res, error?.statusCode ?? (/JSON/.test(error?.message ?? "") ? 400 : 500), { error: error instanceof Error ? error.message : String(error) }); }
   });
-  let open=true;
   void loadProfile().then(async profile=>{await new Promise<void>(resolve=>setTimeout(resolve,250));while(open){const updated=store.backfillLocationAccess(profile,100);if(updated<100)break;await new Promise<void>(resolve=>setTimeout(resolve,25));}}).catch(error=>open&&console.error('Location accessibility backfill failed:',error));
-  server.on("close",()=>{open=false;idleEnrichment.stop()});
+  server.on("close",()=>{open=false;idleEnrichment.stop();void runner.shutdown();});
   return server;
 }
 
-export function startDashboardApi(port = 4310): void { createDashboardApi().listen(port, "127.0.0.1", () => console.log(`Diego Career Ops: http://127.0.0.1:${port}`)); }
+export function startDashboardApi(port = 4310): void {
+  const server=createDashboardApi(),shutdown=()=>server.close();
+  process.once("SIGINT",shutdown);process.once("SIGTERM",shutdown);
+  server.on("close",()=>{process.removeListener("SIGINT",shutdown);process.removeListener("SIGTERM",shutdown);});
+  server.listen(port,"127.0.0.1",()=>console.log(`Diego Career Ops: http://127.0.0.1:${port}`));
+}

@@ -660,7 +660,8 @@ export async function discover(
       store.updateRecallCheckpoint(id,counts);
       progress(`${counts.processed} processed | ${counts.employers} employers | ${counts.newJobs} new jobs | ${counts.errors} errors`);
     };
-    const waiting=[...queue],active=new Set<Promise<any>>(),hostUse=new Map<string,number>(),providerUse=new Map<string,number>(),availableSlots=Array.from({length:adaptive?8:concurrency},(_,index)=>index+1),providerRecentFailures=new Map<string,boolean[]>(),adaptiveProviderLimits=new Map<string,number>();let currentConcurrency=concurrency;
+    const waiting=[...queue],active=new Set<Promise<any>>(),hostUse=new Map<string,number>(),providerUse=new Map<string,number>(),availableSlots=Array.from({length:adaptive?8:concurrency},(_,index)=>index+1),providerRecentFailures=new Map<string,boolean[]>(),adaptiveProviderLimits=new Map<string,number>(),candidateScores=new Map<string,number>();let currentConcurrency=concurrency;
+    const scoreWaiting=()=>{const unscored=waiting.filter(item=>!candidateScores.has(item.candidateId));if(!unscored.length)return;const scores=store.adaptiveCandidateScores(unscored.map(item=>item.candidate));unscored.forEach((item,index)=>candidateScores.set(item.candidateId,scores[index]??0));};
     const baseProviderLimit=(provider:string)=>provider==="workday"||provider==="ashby"?2:currentConcurrency;
     const providerLimit=(provider:string)=>adaptive?adaptiveProviderLimits.get(provider)??baseProviderLimit(provider):baseProviderLimit(provider);
     const executeCandidate=(item:typeof queue[number],workerId:string):Promise<any>=>{
@@ -828,7 +829,7 @@ export async function discover(
       const launchableWaiting=waiting.filter(circuitAllows).length;
       if(adaptive&&Date.now()<deadlineAt&&launchableWaiting<currentConcurrency*2&&adaptiveExhausted.size<configuredSources.length){const added=await pullAdaptive();const known=new Set(waiting.map(item=>item.candidateId));for(const item of added)if(!known.has(item.candidateId))waiting.push(item);}
       let launched=false;
-      if(adaptive){const candidateScores=new Map(waiting.map(item=>[item.candidateId,store.adaptiveCandidateScore(item.candidate)]));waiting.sort((a,b)=>(candidateScores.get(b.candidateId)??0)-(candidateScores.get(a.candidateId)??0)||a.ordinal-b.ordinal);}
+      if(adaptive){scoreWaiting();waiting.sort((a,b)=>(candidateScores.get(b.candidateId)??0)-(candidateScores.get(a.candidateId)??0)||a.ordinal-b.ordinal);}
       while(active.size<currentConcurrency&&availableSlots.length&&(!adaptive||Date.now()<deadlineAt)){
         const index=waiting.findIndex(item=>{const key=destinationHost(item.candidate),provider=schedulingProvider(item.candidate);return (circuit.get(key)??0)<5&&(providerCircuit.get(provider)??0)<5&&(hostUse.get(key)??0)<hostLimit(item.candidate)&&(providerUse.get(provider)??0)<providerLimit(provider);});
         if(index<0)break;
@@ -837,7 +838,7 @@ export async function discover(
         const release=(outcome?:any)=>{hostUse.set(key,Math.max(0,(hostUse.get(key)??1)-1));providerUse.set(provider,Math.max(0,(providerUse.get(provider)??1)-1));active.delete(promise);availableSlots.push(slot);if(adaptive&&outcome){const recent=providerRecentFailures.get(provider)??[];recent.push(operationalFailures.has(outcome.result));if(recent.length>20)recent.shift();providerRecentFailures.set(provider,recent);const rate=recent.filter(Boolean).length/recent.length,priorLimit=providerLimit(provider),maximum=baseProviderLimit(provider),nextLimit=rate>.2?Math.max(1,priorLimit-1):recent.length>=5&&rate<.1?Math.min(maximum,priorLimit+1):priorLimit;if(nextLimit!==priorLimit){adaptiveProviderLimits.set(provider,nextLimit);store.recordDiscoveryEvent(id,{phase:"processing",type:"provider-concurrency-adjusted",level:nextLimit<priorLimit?"error":"info",message:`${provider} concurrency ${nextLimit<priorLimit?'reduced':'increased'} from ${priorLimit} to ${nextLimit}`,metadata:{provider,priorLimit,nextLimit,recentFailureRate:rate,sampleSize:recent.length}});}store.db.prepare("UPDATE discovery_runs SET current_concurrency=?,worker_count=? WHERE id=?").run(currentConcurrency,currentConcurrency,id);}};
         void promise.then(release,()=>release());
       }
-      if(active.size){if(adaptive&&Date.now()>=drainDeadlineAt){controller.abort(new Error("Discovery drain deadline reached"));break;}await Promise.race(active);}
+      if(active.size){if(adaptive&&Date.now()>=drainDeadlineAt){controller.abort(new Error("Discovery drain deadline reached"));break;}await Promise.race(active);await new Promise<void>(resolve=>setImmediate(resolve));}
       else if(!launched){
         for(const [provider,failures] of providerCircuit)if(failures>=5&&!reportedProviderCircuits.has(provider)){
           reportedProviderCircuits.add(provider);

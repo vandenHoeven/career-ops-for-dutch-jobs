@@ -72,9 +72,9 @@ Excluded observations remain available through the match-state filters, so uncer
 
 Applications can be managed as a board or table. The pipeline uses these exact stages:
 
-`saved`, `preparing`, `applied`, `screening`, `interview`, `assessment`, `offer`, `hired`, `rejected`, and `withdrawn`.
+`saved`, `preparing`, `applied`, `screening`, `interview` (First interview), `second_interview`, `assessment`, `offer`, `hired`, `rejected`, and `withdrawn`.
 
-Cards can be moved between pipeline groups, while the job detail page stores the precise stage, applied date, next follow-up, notes, documents, and status history.
+Cards can be moved between exact workflow columns. Hired applications remain in the Offer column, while Rejected and Withdrawn use separate collapsible outcome columns. The job detail page stores the precise stage, applied date, next follow-up, notes, documents, and status history.
 
 ### Employers
 
