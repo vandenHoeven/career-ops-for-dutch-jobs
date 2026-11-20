@@ -11,9 +11,10 @@ import type { DiscoverySource } from "../src/types.js";
 test("recency rewards only verified recent posting dates",()=>{
   const now=Date.parse("2026-11-13T12:00:00Z"),days=(value:number)=>new Date(now-value*86_400_000).toISOString();
   assert.deepEqual(recencyReward(days(7),now),{reward:1,band:"0-7"});
-  assert.deepEqual(recencyReward(days(8),now),{reward:.4,band:"8-30"});
-  assert.deepEqual(recencyReward(days(31),now),{reward:.1,band:"31-60"});
+  assert.deepEqual(recencyReward(days(8),now),{reward:0,band:"8-30"});
+  assert.deepEqual(recencyReward(days(31),now),{reward:0,band:"31-60"});
   assert.deepEqual(recencyReward(days(61),now),{reward:0,band:"older"});
+  assert.deepEqual(recencyReward(new Date(now+86_400_000).toISOString(),now),{reward:0,band:"unknown"});
   assert.deepEqual(recencyReward(undefined,now),{reward:0,band:"unknown"});
 });
 
@@ -48,6 +49,25 @@ test("run outcomes separate new strong matches from reward-eligible matches",()=
     store.recordDiscoveryOutcome("run","fresh",candidate,new Date(Date.now()-2*86_400_000).toISOString(),{isNew:true,matchState:"strong"});
     store.recordDiscoveryOutcome("run","unknown",candidate,undefined,{isNew:true,matchState:"strong"});
     const row=store.db.prepare("SELECT new_strong_count,useful_match_count,weighted_reward,unknown_date_count,metrics_version FROM discovery_runs WHERE id='run'").get() as any;assert.equal(row.new_strong_count,2);assert.equal(row.useful_match_count,1);assert.equal(row.weighted_reward,1);assert.equal(row.unknown_date_count,1);assert.equal(row.metrics_version,2);
+  }finally{store.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+test("only strong matches posted within seven days earn discovery value",()=>{
+  const dir=mkdtempSync(join(tmpdir(),"diego-adaptive-seven-day-")),store=new Store(join(dir,"test.sqlite"));
+  try{store.claimTimedDiscoveryRun("run",300_000);const candidate={sourceId:"feed",company:"Example"},now=Date.now();
+    store.recordDiscoveryOutcome("run","fresh",candidate,new Date(now-6*86_400_000).toISOString(),{isNew:true,matchState:"strong"});
+    store.recordDiscoveryOutcome("run","stale",candidate,new Date(now-8*86_400_000).toISOString(),{isNew:true,matchState:"strong"});
+    const outcomes=store.db.prepare("SELECT job_id,reward FROM discovery_outcomes WHERE run_id='run' ORDER BY job_id").all() as any[],run=store.db.prepare("SELECT strategy_version,new_strong_count,useful_match_count,weighted_reward FROM discovery_runs WHERE id='run'").get() as any;
+    assert.deepEqual(outcomes.map(row=>[row.job_id,row.reward]),[["fresh",1],["stale",0]]);assert.deepEqual({...run},{strategy_version:3,new_strong_count:2,useful_match_count:1,weighted_reward:1});
+  }finally{store.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+test("adaptive forecast includes interrupted exposure and produces nonlinear duration choices",()=>{
+  const dir=mkdtempSync(join(tmpdir(),"diego-adaptive-forecast-")),store=new Store(join(dir,"test.sqlite")),source={id:"feed",label:"Feed"};
+  try{const now=new Date().toISOString(),fresh=new Date(Date.now()-86_400_000).toISOString();
+    for(const [id,status,duration,count] of [["complete","completed",300_000,3],["interrupted","interrupted",120_000,1]] as const){store.claimTimedDiscoveryRun(id,1_200_000);store.recordDiscoveryPull({runId:id,armId:"source:feed",sourceId:"feed",label:"Feed",startedAt:now,durationMs:10_000,cursor:0,requested:10,returned:10,eligible:10});for(let index=0;index<count;index++)store.recordDiscoveryOutcome(id,`${id}-${index}`,{sourceId:"feed",company:"Example"},fresh,{isNew:true,matchState:"strong"});store.db.prepare("UPDATE discovery_runs SET status=?,finished_at=?,duration_ms=? WHERE id=?").run(status,now,duration,id);}
+    const forecast=store.adaptiveForecast(10,[source]),rows=forecast.durations;
+    assert.equal(forecast.trainingRuns,2);assert.equal(forecast.target,"new-strong-posted-within-7-days");assert.equal(forecast.selectedForecast.durationMinutes,10);assert.equal(rows.filter((row:any)=>row.bestValue).length,1);assert.ok(rows[3].expectedFreshStrongMatches<rows[0].expectedFreshStrongMatches*6,"long runs saturate instead of scaling linearly");assert.ok(rows.every((row:any)=>row.probabilityAtLeastOne>=0&&row.probabilityAtLeastOne<=100&&row.probabilityAtLeastFive>=0&&row.probabilityAtLeastFive<=100));
   }finally{store.close();rmSync(dir,{recursive:true,force:true});}
 });
 

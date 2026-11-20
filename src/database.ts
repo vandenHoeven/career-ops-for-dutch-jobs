@@ -5,7 +5,7 @@ import { databasePath } from "./config.js";
 import { BENCHMARK_EMPLOYERS, BENCHMARK_VERSION } from "./benchmark.js";
 import { buildTransparentForecast, buildTransparentForecastSeries, type ForecastMode, type ForecastPlanRow, type ForecastSeriesInput, type TransparentForecast } from "./forecast.js";
 import { classifyLocationAccess } from "./locations.js";
-import { discoveryArmId, rankAdaptiveArms, recencyReward, type AdaptiveEvidence } from "./adaptive-discovery.js";
+import { ADAPTIVE_FORECAST_MODEL_VERSION, ADAPTIVE_STRATEGY_VERSION, ADAPTIVE_TARGET, DISCOVERY_DURATIONS, discoveryArmId, negativeBinomialCdf, negativeBinomialQuantile, rankAdaptiveArms, recencyReward, type AdaptiveDurationForecast, type AdaptiveEvidence } from "./adaptive-discovery.js";
 import type { ApplicationRecord, ApplicationStage, DiscoveryAttempt, DiscoveryCandidate, DiscoverySourceArm, Employer, JobPosting, JobStatus, LocationAccessAssessment, LocationAccessTier, ProviderId, ReviewState, ScoreLedger, SourceConfig } from "./types.js";
 
 export interface JobQuery {
@@ -243,6 +243,7 @@ export class Store {
     this.ensureColumn("discovery_runs", "unknown_date_count", "INTEGER NOT NULL DEFAULT 0");
     this.ensureColumn("discovery_runs", "new_strong_count", "INTEGER NOT NULL DEFAULT 0");
     this.ensureColumn("discovery_runs", "metrics_version", "INTEGER NOT NULL DEFAULT 1");
+    this.ensureColumn("discovery_runs", "strategy_version", "INTEGER NOT NULL DEFAULT 1");
     this.ensureColumn("discovery_run_sources", "fresh_count", "INTEGER NOT NULL DEFAULT 0");
     this.ensureColumn("discovery_run_sources", "recheck_count", "INTEGER NOT NULL DEFAULT 0");
     this.ensureColumn("discovery_run_sources", "continuation_count", "INTEGER NOT NULL DEFAULT 0");
@@ -292,6 +293,20 @@ export class Store {
     this.migrateCoverage();
     this.ensureColumn("discovery_outcomes","is_new","INTEGER NOT NULL DEFAULT 0");
     this.ensureColumn("discovery_outcomes","match_state","TEXT NOT NULL DEFAULT 'possible'");
+    this.db.exec(`CREATE TABLE IF NOT EXISTS discovery_forecast_previews(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,created_at TEXT NOT NULL,selected_duration INTEGER NOT NULL,
+      model_version TEXT NOT NULL,target TEXT NOT NULL,prediction_json TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS discovery_forecast_previews_created ON discovery_forecast_previews(created_at);`);
+    // Version 3 makes freshness binary: only a new strong posting no older than
+    // seven days has value. Rebuild derived v2+ counters from the immutable
+    // per-job outcomes so older weighted rewards cannot leak into forecasts.
+    this.db.exec(`UPDATE discovery_outcomes SET reward=CASE WHEN new_strong=1 AND date_band='0-7' AND posted_at IS NOT NULL AND datetime(posted_at)<=datetime(occurred_at) THEN 1 ELSE 0 END
+      WHERE run_id IN (SELECT id FROM discovery_runs WHERE metrics_version>=2);
+      UPDATE discovery_runs SET
+        useful_match_count=(SELECT COUNT(*) FROM discovery_outcomes o WHERE o.run_id=discovery_runs.id AND o.reward=1),
+        weighted_reward=(SELECT COUNT(*) FROM discovery_outcomes o WHERE o.run_id=discovery_runs.id AND o.reward=1)
+      WHERE metrics_version>=2;`);
     this.seedBenchmark();
     this.db.exec(`UPDATE jobs SET provider_first_observed_at=posted_at,posted_at=NULL,
       summary=COALESCE(summary,json_extract(raw_json,'$.gist'))
@@ -393,7 +408,7 @@ export class Store {
   claimTimedDiscoveryRun(id:string,durationMs:number):{claimed:true}|{claimed:false;activeRun:any}{
     const result=this.claimDiscoveryRun(id,undefined,0,undefined,"adaptive",4,false);if(!result.claimed)return result;
     const now=Date.now(),deadline=new Date(now+durationMs).toISOString(),drain=new Date(now+durationMs+30_000).toISOString();
-    this.db.prepare("UPDATE discovery_runs SET time_budget_ms=?,deadline_at=?,drain_deadline_at=?,current_concurrency=4,selection_policy='adaptive-time',metrics_version=2 WHERE id=?").run(durationMs,deadline,drain,id);return result;
+    this.db.prepare("UPDATE discovery_runs SET time_budget_ms=?,deadline_at=?,drain_deadline_at=?,current_concurrency=4,selection_policy='adaptive-time',metrics_version=2,strategy_version=? WHERE id=?").run(durationMs,deadline,drain,ADAPTIVE_STRATEGY_VERSION,id);return result;
   }
   startDiscoveryRun(id: string, sourceId: string | undefined, limit: number, plan?:any, mode="balanced", workerCount=6): void { const now=new Date().toISOString();this.db.prepare("INSERT INTO discovery_runs(id,source_id,started_at,status,limit_count,heartbeat_at,process_id,plan_json,mode,worker_count,phase,phase_message,selection_policy) VALUES(?,?,?,?,?,?,?,?,?,?,'planning','Preparing discovery sources',?)").run(id,sourceId??null,now,"running",limit,now,process.pid,plan?JSON.stringify(plan):null,mode,workerCount,plan?.rules?.selectionPolicy??(plan?'strict':'explicit-source')); }
   saveDiscoveryPlan(id:string,plan:any):void { this.db.prepare('UPDATE discovery_runs SET plan_json=?,selection_policy=? WHERE id=?').run(JSON.stringify(plan),plan?.rules?.selectionPolicy??'strict',id);const insert=this.db.prepare(`INSERT INTO discovery_run_sources(run_id,source_id,label,category,planned_count) VALUES(?,?,?,?,?) ON CONFLICT(run_id,source_id) DO UPDATE SET label=excluded.label,category=excluded.category,planned_count=excluded.planned_count`);for(const row of plan.sources)insert.run(id,row.id,row.label,row.category,row.planned); }
@@ -428,19 +443,19 @@ export class Store {
   }
   adaptiveArmRanking(sourceRows:Array<{id:string;label:string}>):any[]{
     const pullHistory=new Map((this.db.prepare(`WITH pull_cost AS (
-        SELECT p.source_id,SUM(MAX(p.returned,1)) pulls,SUM(p.duration_ms) acquisition_ms,SUM(p.failures) pull_failures,SUM(p.duplicates) duplicates,MAX(p.started_at) last_at
+        SELECT p.source_id,COUNT(*) pulls,SUM(p.duration_ms) acquisition_ms,SUM(p.failures) pull_failures,SUM(p.duplicates) duplicates,MAX(p.started_at) last_at
         FROM discovery_source_pulls p JOIN discovery_runs r ON r.id=p.run_id WHERE r.metrics_version>=2 AND p.started_at>=datetime('now','-30 days') GROUP BY p.source_id
       ), processing_cost AS (
         SELECT a.source_id,SUM(a.duration_ms) processing_ms,SUM(CASE WHEN a.result IN ('timeout','rate-limited','network-error','parse-error','invalid-record') THEN 1 ELSE 0 END) processing_failures
         FROM discovery_attempts a JOIN discovery_runs r ON r.id=a.run_id WHERE r.metrics_version>=2 AND a.started_at>=datetime('now','-30 days') GROUP BY a.source_id
       ) SELECT p.source_id,p.pulls,p.acquisition_ms+COALESCE(c.processing_ms,0) worker_ms,p.pull_failures+COALESCE(c.processing_failures,0) failures,p.duplicates,p.last_at
-      FROM pull_cost p LEFT JOIN processing_cost c ON c.source_id=p.source_id`).all() as any[]).map(row=>[String(row.source_id),row])),rewards=new Map((this.db.prepare(`SELECT o.source_id,SUM(o.reward) reward FROM discovery_outcomes o JOIN discovery_runs r ON r.id=o.run_id WHERE r.metrics_version>=2 AND o.occurred_at>=datetime('now','-30 days') GROUP BY o.source_id`).all() as any[]).map(row=>[String(row.source_id),Number(row.reward??0)]));
+      FROM pull_cost p LEFT JOIN processing_cost c ON c.source_id=p.source_id`).all() as any[]).map(row=>[String(row.source_id),row])),rewards=new Map((this.db.prepare(`SELECT o.source_id,SUM(o.reward) reward FROM discovery_outcomes o JOIN discovery_runs r ON r.id=o.run_id WHERE r.metrics_version>=2 AND o.occurred_at>=datetime('now','-56 days') GROUP BY o.source_id`).all() as any[]).map(row=>[String(row.source_id),Number(row.reward??0)]));
     const evidence:AdaptiveEvidence[]=sourceRows.map(row=>{const pull=pullHistory.get(row.id);return {armId:`source:${row.id}`,sourceId:row.id,label:row.label,pulls:Number(pull?.pulls??0),workerMs:Number(pull?.worker_ms??0),reward:rewards.get(row.id)??0,failures:Number(pull?.failures??0),duplicates:Number(pull?.duplicates??0),lastAt:pull?.last_at};});
     return rankAdaptiveArms(evidence);
   }
   adaptiveSearchArmRanking(sourceId:string,arms:DiscoverySourceArm[]):any[]{
-    const rows=this.db.prepare(`SELECT p.arm_id,SUM(MAX(p.returned,1)) pulls,SUM(p.duration_ms)+COALESCE((SELECT SUM(a.duration_ms) FROM discovery_attempts a JOIN discovery_runs ra ON ra.id=a.run_id WHERE ra.metrics_version>=2 AND json_extract(a.candidate_json,'$.searchArmId')=p.arm_id AND a.started_at>=datetime('now','-30 days')),0) worker_ms,SUM(p.failures)+COALESCE((SELECT SUM(CASE WHEN a.result IN ('timeout','rate-limited','network-error','parse-error','invalid-record') THEN 1 ELSE 0 END) FROM discovery_attempts a JOIN discovery_runs ra ON ra.id=a.run_id WHERE ra.metrics_version>=2 AND json_extract(a.candidate_json,'$.searchArmId')=p.arm_id AND a.started_at>=datetime('now','-30 days')),0) failures,SUM(p.duplicates) duplicates,MAX(p.started_at) last_at,
-      COALESCE((SELECT SUM(o.reward) FROM discovery_outcomes o JOIN discovery_runs ro ON ro.id=o.run_id WHERE ro.metrics_version>=2 AND o.arm_id=p.arm_id AND o.occurred_at>=datetime('now','-30 days')),0) reward
+    const rows=this.db.prepare(`SELECT p.arm_id,COUNT(*) pulls,SUM(p.duration_ms)+COALESCE((SELECT SUM(a.duration_ms) FROM discovery_attempts a JOIN discovery_runs ra ON ra.id=a.run_id WHERE ra.metrics_version>=2 AND json_extract(a.candidate_json,'$.searchArmId')=p.arm_id AND a.started_at>=datetime('now','-30 days')),0) worker_ms,SUM(p.failures)+COALESCE((SELECT SUM(CASE WHEN a.result IN ('timeout','rate-limited','network-error','parse-error','invalid-record') THEN 1 ELSE 0 END) FROM discovery_attempts a JOIN discovery_runs ra ON ra.id=a.run_id WHERE ra.metrics_version>=2 AND json_extract(a.candidate_json,'$.searchArmId')=p.arm_id AND a.started_at>=datetime('now','-30 days')),0) failures,SUM(p.duplicates) duplicates,MAX(p.started_at) last_at,
+      COALESCE((SELECT SUM(o.reward) FROM discovery_outcomes o JOIN discovery_runs ro ON ro.id=o.run_id WHERE ro.metrics_version>=2 AND o.arm_id=p.arm_id AND o.occurred_at>=datetime('now','-56 days')),0) reward
       FROM discovery_source_pulls p JOIN discovery_runs r ON r.id=p.run_id WHERE r.metrics_version>=2 AND p.source_id=? AND p.started_at>=datetime('now','-30 days') GROUP BY p.arm_id`).all(sourceId) as any[],byId=new Map(rows.map(row=>[String(row.arm_id),row]));
     return rankAdaptiveArms(arms.map(arm=>{const row=byId.get(arm.id);return {armId:arm.id,sourceId,label:arm.label,pulls:Number(row?.pulls??0),workerMs:Number(row?.worker_ms??0),reward:Number(row?.reward??0),failures:Number(row?.failures??0),duplicates:Number(row?.duplicates??0),lastAt:row?.last_at};}));
   }
@@ -450,7 +465,7 @@ export class Store {
     const armId=discoveryArmId(candidate),attempt=this.db.prepare(`SELECT COUNT(*) pulls,SUM(COALESCE(collection_duration_ms,duration_ms)) worker_ms,
       SUM(CASE WHEN result IN ('timeout','rate-limited','network-error','parse-error','invalid-record') THEN 1 ELSE 0 END) failures,MAX(started_at) last_at
       FROM discovery_attempts WHERE board_url=? AND started_at>=datetime('now','-30 days')`).get(candidate.boardUrl) as any,
-      outcome=this.db.prepare("SELECT SUM(reward) reward FROM discovery_outcomes WHERE arm_id=? AND occurred_at>=datetime('now','-30 days')").get(armId) as any;
+      outcome=this.db.prepare("SELECT SUM(reward) reward FROM discovery_outcomes WHERE arm_id=? AND occurred_at>=datetime('now','-56 days')").get(armId) as any;
     return Number(rankAdaptiveArms([{armId,sourceId:candidate.sourceId,label:candidate.company,pulls:Number(attempt?.pulls??0),workerMs:Number(attempt?.worker_ms??0),reward:Number(outcome?.reward??0),failures:Number(attempt?.failures??0),duplicates:0,lastAt:attempt?.last_at}])[0]?.score??0);
   }
   adaptiveCandidateScores(candidates:DiscoveryCandidate[]):number[]{
@@ -459,12 +474,60 @@ export class Store {
     const boards=[...new Set(candidates.flatMap(candidate=>candidate.boardUrl?[candidate.boardUrl]:[]))],attempts=new Map<string,any>();
     for(let offset=0;offset<boards.length;offset+=400){const chunk=boards.slice(offset,offset+400),placeholders=chunk.map(()=>'?').join(',');if(!chunk.length)continue;for(const row of this.db.prepare(`SELECT board_url,COUNT(*) pulls,SUM(COALESCE(collection_duration_ms,duration_ms)) worker_ms,SUM(CASE WHEN result IN ('timeout','rate-limited','network-error','parse-error','invalid-record') THEN 1 ELSE 0 END) failures,MAX(started_at) last_at FROM discovery_attempts WHERE board_url IN (${placeholders}) AND started_at>=datetime('now','-30 days') GROUP BY board_url`).all(...chunk) as any[])attempts.set(String(row.board_url),row);}
     const arms=[...new Set(candidates.filter(candidate=>candidate.boardUrl).map(discoveryArmId))],rewards=new Map<string,number>();
-    for(let offset=0;offset<arms.length;offset+=400){const chunk=arms.slice(offset,offset+400),placeholders=chunk.map(()=>'?').join(',');if(!chunk.length)continue;for(const row of this.db.prepare(`SELECT arm_id,SUM(reward) reward FROM discovery_outcomes WHERE arm_id IN (${placeholders}) AND occurred_at>=datetime('now','-30 days') GROUP BY arm_id`).all(...chunk) as any[])rewards.set(String(row.arm_id),Number(row.reward??0));}
+    for(let offset=0;offset<arms.length;offset+=400){const chunk=arms.slice(offset,offset+400),placeholders=chunk.map(()=>'?').join(',');if(!chunk.length)continue;for(const row of this.db.prepare(`SELECT arm_id,SUM(reward) reward FROM discovery_outcomes WHERE arm_id IN (${placeholders}) AND occurred_at>=datetime('now','-56 days') GROUP BY arm_id`).all(...chunk) as any[])rewards.set(String(row.arm_id),Number(row.reward??0));}
     return candidates.map(candidate=>{if(!candidate.boardUrl)return sourceScores.get(candidate.sourceId)??0;const armId=discoveryArmId(candidate),attempt=attempts.get(candidate.boardUrl);return Number(rankAdaptiveArms([{armId,sourceId:candidate.sourceId,label:candidate.company,pulls:Number(attempt?.pulls??0),workerMs:Number(attempt?.worker_ms??0),reward:rewards.get(armId)??0,failures:Number(attempt?.failures??0),duplicates:0,lastAt:attempt?.last_at}])[0]?.score??0);});
   }
-  adaptiveForecast(durationMinutes:number,sourceRows:Array<{id:string;label:string}>):any{
-    const arms=this.adaptiveArmRanking(sourceRows),minutes=durationMinutes,point=arms.slice(0,Math.min(8,arms.length)).reduce((sum,row)=>sum+row.expectedRewardPerMinute,0)*minutes*.55,trainingPulls=arms.reduce((sum,row)=>sum+row.pulls,0),confidence=trainingPulls>=500?'limited':'experimental',radius=Math.max(2,Math.sqrt(point+1)*1.96);
-    return {durationMinutes,target:'new-date-verified-strong-nl',targetDefinition:'Distinct newly discovered strong Netherlands jobs, weighted by verified posting age.',expectedUsefulMatches:{point:Number(point.toFixed(1)),lower:Number(Math.max(0,point-radius).toFixed(1)),upper:Number((point+radius).toFixed(1))},expectedWeightedReward:Number(point.toFixed(1)),confidence,trainingPulls,arms:arms.slice(0,12),warnings:[trainingPulls?'Forecast uses measured metrics-v2 pulls only.':'Metrics v2 starts without legacy timing assumptions; confidence will improve after new timed runs.'],recencyWeights:{'0-7':1,'8-30':.4,'31-60':.1,older:0,unknown:0}};
+  private adaptiveRunEvidence():any[]{
+    return this.db.prepare(`SELECT r.id,r.started_at,r.finished_at,r.status,r.duration_ms,r.time_budget_ms,
+      COALESCE((SELECT SUM(p.duration_ms) FROM discovery_source_pulls p WHERE p.run_id=r.id),0)+
+      COALESCE((SELECT SUM(a.duration_ms) FROM discovery_attempts a WHERE a.run_id=r.id),0) productive_ms,
+      COALESCE((SELECT COUNT(*) FROM discovery_attempts a WHERE a.run_id=r.id),0)+
+      COALESCE((SELECT COUNT(*) FROM discovery_source_pulls p WHERE p.run_id=r.id),0) operations,
+      COALESCE((SELECT SUM(CASE WHEN a.result IN ('timeout','rate-limited','network-error','parse-error','invalid-record') THEN 1 ELSE 0 END) FROM discovery_attempts a WHERE a.run_id=r.id),0)+
+      COALESCE((SELECT SUM(p.failures) FROM discovery_source_pulls p WHERE p.run_id=r.id),0) failures,
+      COALESCE((SELECT SUM(o.reward) FROM discovery_outcomes o WHERE o.run_id=r.id),0) fresh_strong
+      FROM discovery_runs r WHERE r.metrics_version>=2 AND r.status IN ('completed','partial','interrupted','failed')
+      AND r.finished_at IS NOT NULL AND r.started_at>=datetime('now','-56 days') ORDER BY r.started_at`).all() as any[];
+  }
+  private adaptiveCalibration():{label:'early'|'calibrated';samples:number;coverage80:number|null}{
+    const rows=this.db.prepare("SELECT input_json,prediction_json,actual_new_strong FROM discovery_forecasts WHERE model_version=? AND actual_new_strong IS NOT NULL ORDER BY created_at DESC LIMIT 200").all(ADAPTIVE_FORECAST_MODEL_VERSION) as any[];
+    let covered=0,usable=0;
+    for(const row of rows){try{const input=JSON.parse(row.input_json),prediction=JSON.parse(row.prediction_json),selected=(prediction.durations??[]).find((item:any)=>item.durationMinutes===Number(input.durationMinutes));if(!selected)continue;usable++;const actual=Number(row.actual_new_strong);if(actual>=selected.likelyRange.lower&&actual<=selected.likelyRange.upper)covered++;}catch{/* Ignore pre-schema snapshots. */}}
+    const coverage=usable?covered/usable:null;
+    return {label:usable>=40&&coverage!==null&&coverage>=.7&&coverage<=.9?'calibrated':'early',samples:usable,coverage80:coverage===null?null:Number(coverage.toFixed(3))};
+  }
+  adaptiveForecast(durationMinutes:number,sourceRows:Array<{id:string;label:string}>,asOf=Date.now()):any{
+    const arms=this.adaptiveArmRanking(sourceRows),runs=this.adaptiveRunEvidence(),selected=durationMinutes,formatWeekday=(timestamp:number)=>new Intl.DateTimeFormat('en-US',{timeZone:'Europe/Amsterdam',weekday:'short'}).format(timestamp),weekday=formatWeekday(asOf);
+    const elapsedMinutes=(row:any)=>{const elapsed=Number(row.duration_ms)>0?Number(row.duration_ms):Math.max(0,Date.parse(row.finished_at)-Date.parse(row.started_at));return Math.max(.25,elapsed/60_000);};
+    const reliability=(row:any)=>Math.max(.2,1-Math.min(1,Number(row.failures??0)/Math.max(1,Number(row.operations??0))));
+    const weights=runs.map(row=>Math.pow(.5,Math.max(0,(asOf-Date.parse(row.started_at))/86_400_000)/56));
+    let weightedFresh=0,weightedEffectiveMinutes=0,weightedReliability=0,weightTotal=0;
+    runs.forEach((row,index)=>{const weight=weights[index],available=reliability(row);weightedFresh+=Number(row.fresh_strong??0)*weight;weightedEffectiveMinutes+=elapsedMinutes(row)*available*weight;weightedReliability+=available*weight;weightTotal+=weight;});
+    const observedReliability=weightTotal?weightedReliability/weightTotal:.75,baseRate=weightedEffectiveMinutes?weightedFresh/weightedEffectiveMinutes:0;
+    const weekdayRows=runs.map((row,index)=>({row,index})).filter(({row})=>formatWeekday(Date.parse(row.started_at))===weekday),weekdayFresh=weekdayRows.reduce((sum,{row,index})=>sum+Number(row.fresh_strong??0)*weights[index],0),weekdayMinutes=weekdayRows.reduce((sum,{row,index})=>sum+elapsedMinutes(row)*reliability(row)*weights[index],0),weekdayRate=weekdayMinutes?weekdayFresh/weekdayMinutes:baseRate,weekdayFactor=baseRate?Math.max(.8,Math.min(1.2,(weekdayRate*weekdayRows.length+baseRate*10)/(baseRate*(weekdayRows.length+10)))):1;
+    const previous=runs.at(-1),hoursSincePrevious=previous?Math.max(0,(asOf-Date.parse(previous.finished_at??previous.started_at))/3_600_000):168,recoveryFactor=.7+.3*(1-Math.exp(-hoursSincePrevious/8)),previousRate=previous?Number(previous.fresh_strong??0)/(elapsedMinutes(previous)*reliability(previous)):baseRate,previousFactor=baseRate?Math.max(.8,Math.min(1.2,.9+.1*(previousRate/baseRate))):1,provenArms=arms.filter(row=>row.pulls>0).slice(0,8),armWeight=provenArms.reduce((sum,row)=>sum+Math.max(.05,row.expectedRewardPerMinute),0),sourceRecovery=armWeight?provenArms.reduce((sum,row)=>{const hours=row.lastAt?Math.max(0,(asOf-Date.parse(row.lastAt))/3_600_000):168,tau=/jobspy|linkedin/.test(row.sourceId)?6:24;return sum+Math.max(.05,row.expectedRewardPerMinute)*(1-Math.exp(-hours/tau));},0)/armWeight:1,sourceAvailabilityFactor=Math.max(.65,Math.min(1.2,sourceRecovery/.75));
+    const dispersion=Math.max(2,Math.min(20,runs.length/2||2)),saturationMinutes=20;
+    const build=(minutes:number):AdaptiveDurationForecast=>{
+      const effectiveMinutes=saturationMinutes*(1-Math.exp(-minutes/saturationMinutes)),mean=Math.max(0,baseRate*effectiveMinutes*observedReliability*recoveryFactor*sourceAvailabilityFactor*weekdayFactor*previousFactor),lower=negativeBinomialQuantile(.1,mean,dispersion),upper=negativeBinomialQuantile(.9,mean,dispersion);
+      return {durationMinutes:minutes as any,expectedFreshStrongMatches:round1(mean),likelyRange:{lower,upper,level:.8},probabilityAtLeastOne:round1((1-negativeBinomialCdf(0,mean,dispersion))*100),probabilityAtLeastFive:round1((1-negativeBinomialCdf(4,mean,dispersion))*100),expectedPerMinute:round1(mean/minutes),marginalMatches:0,marginalPerMinute:0,bestValue:false};
+    };
+    const durations=DISCOVERY_DURATIONS.map(build);let priorPoint=0,priorMinutes=0;
+    for(const item of durations){item.marginalMatches=round1(item.expectedFreshStrongMatches-priorPoint);item.marginalPerMinute=round1(item.marginalMatches/(item.durationMinutes-priorMinutes));priorPoint=item.expectedFreshStrongMatches;priorMinutes=item.durationMinutes;}
+    const qualifying=durations.find(item=>item.probabilityAtLeastFive>=80),best=qualifying??durations.reduce((winner,item)=>item.marginalPerMinute>winner.marginalPerMinute?item:winner,durations[0]);best.bestValue=true;
+    const chosen=durations.find(item=>item.durationMinutes===selected)!,calibration=this.adaptiveCalibration(),weekdaySupported=weekdayRows.length>=4,trainingPulls=arms.reduce((sum,row)=>sum+row.pulls,0),reasons=[previous?`Last optimized run ended ${hoursSincePrevious<1?`${Math.max(1,Math.round(hoursSincePrevious*60))} minutes`:`${round1(hoursSincePrevious)} hours`} ago.`:'No previous optimized run is available.'];
+    if(provenArms.length)reasons.push(`The best known sources are ${Math.round(sourceRecovery*100)}% recovered.`);if(weekdaySupported)reasons.push(`${weekday} is based on ${weekdayRows.length} compatible run${weekdayRows.length===1?'':'s'}.`);else reasons.push(`Weekday adjustment is restrained until more ${weekday} runs are observed.`);
+    return {modelVersion:ADAPTIVE_FORECAST_MODEL_VERSION,strategyVersion:ADAPTIVE_STRATEGY_VERSION,durationMinutes:selected,target:ADAPTIVE_TARGET,targetDefinition:'Distinct newly discovered strong Netherlands jobs with a verified posting age of seven days or less.',durations,selectedForecast:chosen,expectedUsefulMatches:{point:chosen.expectedFreshStrongMatches,lower:chosen.likelyRange.lower,upper:chosen.likelyRange.upper},confidence:calibration.label==='calibrated'?'calibrated':'early estimate',calibration,trainingRuns:runs.length,trainingPulls,arms:arms.slice(0,12),reasons,warnings:[runs.length?'Only metrics-v2+ expected-reward-per-second runs train this estimate.':'No compatible terminal runs yet; forecasts will remain near zero until evidence arrives.'],recencyWeights:{'0-7':1,'8-30':0,'31-60':0,older:0,unknown:0},diagnostics:{baseFreshStrongPerEffectiveMinute:round1(baseRate),observedReliability:round1(observedReliability*100),recoveryFactor:round1(recoveryFactor),sourceAvailabilityFactor:round1(sourceAvailabilityFactor),weekday,weekdaySamples:weekdayRows.length,previousRunYieldFactor:round1(previousFactor)}};
+  }
+  adaptiveWaitingForecast(sourceRows:Array<{id:string;label:string}>,asOf=Date.now()):any[]{
+    const rows=[{hours:0,label:'Now'},{hours:6,label:'In 6 hours'},{hours:12,label:'In 12 hours'},{hours:24,label:'Tomorrow'}].map(item=>{const forecast=this.adaptiveForecast(10,sourceRows,asOf+item.hours*3_600_000),best=forecast.durations.find((row:any)=>row.bestValue);return {...item,bestDurationMinutes:best.durationMinutes,expectedFreshStrongMatches:best.expectedFreshStrongMatches,probabilityAtLeastFive:best.probabilityAtLeastFive,recommended:false};}),now=rows[0],material=rows.slice(1).filter(row=>row.expectedFreshStrongMatches>=now.expectedFreshStrongMatches+.5&&row.expectedFreshStrongMatches>=now.expectedFreshStrongMatches*1.2),recommended=material.reduce((best,row)=>!best||row.expectedFreshStrongMatches>best.expectedFreshStrongMatches?row:best,undefined as any)??now;
+    recommended.recommended=true;return rows;
+  }
+  saveAdaptiveForecastPreview(selectedDuration:number,forecast:any):void{
+    this.db.prepare("INSERT INTO discovery_forecast_previews(created_at,selected_duration,model_version,target,prediction_json) VALUES(?,?,?,?,?)").run(new Date().toISOString(),selectedDuration,ADAPTIVE_FORECAST_MODEL_VERSION,ADAPTIVE_TARGET,JSON.stringify(forecast));
+    this.db.prepare("DELETE FROM discovery_forecast_previews WHERE id NOT IN (SELECT id FROM discovery_forecast_previews ORDER BY id DESC LIMIT 1000)").run();
+  }
+  saveAdaptiveRunForecast(runId:string,durationMinutes:number,forecast:any):void{
+    this.db.prepare(`INSERT INTO discovery_forecasts(run_id,created_at,model_version,target,input_json,prediction_json) VALUES(?,?,?,?,?,?) ON CONFLICT(run_id) DO UPDATE SET created_at=excluded.created_at,model_version=excluded.model_version,target=excluded.target,input_json=excluded.input_json,prediction_json=excluded.prediction_json`).run(runId,new Date().toISOString(),ADAPTIVE_FORECAST_MODEL_VERSION,ADAPTIVE_TARGET,JSON.stringify({durationMinutes,strategyVersion:ADAPTIVE_STRATEGY_VERSION}),JSON.stringify(forecast));
   }
   discoveryTrace(runId:string,after=0,limit=200):unknown {const row=this.db.prepare("SELECT dropped_event_count FROM discovery_runs WHERE id=?").get(runId) as any;if(!row)return undefined;const items=(this.db.prepare("SELECT sequence,occurred_at,level,phase,event_type,source_id,candidate_id,worker_id,message,url,cursor,attempt,http_status,duration_ms,metadata_json FROM discovery_run_events WHERE run_id=? AND sequence>? ORDER BY sequence LIMIT ?").all(runId,after,Math.min(Math.max(limit,1),500)) as any[]).map(item=>({...item,metadata:item.metadata_json?JSON.parse(item.metadata_json):null,metadata_json:undefined}));return {items,droppedCount:Number(row.dropped_event_count??0),nextAfter:items.at(-1)?.sequence??after};}
   startDiscoveryTask(runId:string,candidateId:string,workerId:string,candidate:DiscoveryCandidate,stage="resolving-board",detail?:string):void {const now=new Date().toISOString();this.db.prepare(`INSERT INTO discovery_run_tasks(run_id,candidate_id,worker_id,source_id,provider,company,board_url,stage,detail,started_at,stage_started_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(run_id,candidate_id) DO UPDATE SET worker_id=excluded.worker_id,stage=excluded.stage,detail=excluded.detail,stage_started_at=excluded.stage_started_at,updated_at=excluded.updated_at`).run(runId,candidateId,workerId,candidate.sourceId,candidate.provider??null,candidate.company,candidate.boardUrl??null,stage,detail??null,now,now,now);}
@@ -496,6 +559,7 @@ export class Store {
   discoveryForecastBudgetSupport():{minLimit:number;maxLimit:number;runs:number}{const row=this.db.prepare("SELECT MIN(limit_count) minLimit,MAX(limit_count) maxLimit,COUNT(*) runs FROM discovery_runs WHERE source_id IS NULL AND status IN ('completed','partial') AND finished_at IS NOT NULL AND processed_count>0").get() as any;return {minLimit:Number(row?.minLimit??1),maxLimit:Number(row?.maxLimit??0),runs:Number(row?.runs??0)};}
   saveDiscoveryForecast(runId:string,input:unknown,forecast:TransparentForecast):void {this.db.prepare(`INSERT INTO discovery_forecasts(run_id,created_at,model_version,target,input_json,prediction_json) VALUES(?,?,?,?,?,?) ON CONFLICT(run_id) DO UPDATE SET created_at=excluded.created_at,model_version=excluded.model_version,target=excluded.target,input_json=excluded.input_json,prediction_json=excluded.prediction_json`).run(runId,new Date().toISOString(),forecast.modelVersion,forecast.target,JSON.stringify(input),JSON.stringify(forecast));}
   private actualNewStrongMatches(runId:string):number {const row=this.db.prepare(`SELECT COUNT(DISTINCT j.id) count FROM discovery_runs r JOIN source_observations so ON so.discovery_run_id=r.id JOIN jobs j ON j.id=so.job_id WHERE r.id=? AND j.match_state='strong' AND datetime(j.first_seen_at)>=datetime(r.started_at)`).get(runId) as any;return Number(row?.count??0);}
+  private actualFreshStrongMatches(runId:string):number {const row=this.db.prepare("SELECT COALESCE(SUM(reward),0) count FROM discovery_outcomes WHERE run_id=?").get(runId) as any;return Number(row?.count??0);}
   pendingEnrichmentCount(runId?:string):number {const row=this.db.prepare(`SELECT COUNT(*) count FROM enrichment_queue WHERE status IN ('pending','failed') AND attempts<4 AND (? IS NULL OR discovery_run_id=?)`).get(runId??null,runId??null) as any;return Number(row?.count??0);}
   eligibleEnrichmentCount():number {const row=this.db.prepare("SELECT COUNT(*) count FROM enrichment_queue WHERE status IN ('pending','failed') AND attempts<4 AND (next_retry_at IS NULL OR next_retry_at<=strftime('%Y-%m-%dT%H:%M:%fZ','now'))").get() as any;return Number(row?.count??0);}
   enrichmentQueueSummary():{eligibleNow:number;coolingDown:number;terminal:number;complete:number;skipped:number;nextRetryAt?:string} {
@@ -509,7 +573,7 @@ export class Store {
       FROM enrichment_queue`).get() as any;
     return {eligibleNow:Number(row?.eligible_now??0),coolingDown:Number(row?.cooling_down??0),terminal:Number(row?.terminal??0),complete:Number(row?.complete??0),skipped:Number(row?.skipped??0),...(row?.next_retry_at?{nextRetryAt:String(row.next_retry_at)}:{})};
   }
-  reconcileDiscoveryForecast(runId:string):void {const pending=this.pendingEnrichmentCount(runId);this.db.prepare("UPDATE discovery_forecasts SET actual_new_strong=?,reconciled_at=? WHERE run_id=?").run(this.actualNewStrongMatches(runId),pending?null:new Date().toISOString(),runId);}
+  reconcileDiscoveryForecast(runId:string):void {const pending=this.pendingEnrichmentCount(runId),snapshot=this.db.prepare("SELECT target FROM discovery_forecasts WHERE run_id=?").get(runId) as any,actual=snapshot?.target===ADAPTIVE_TARGET?this.actualFreshStrongMatches(runId):this.actualNewStrongMatches(runId);this.db.prepare("UPDATE discovery_forecasts SET actual_new_strong=?,reconciled_at=? WHERE run_id=?").run(actual,pending?null:new Date().toISOString(),runId);}
   discoveryForecastSnapshot(runId:string):unknown {const row=this.db.prepare("SELECT * FROM discovery_forecasts WHERE run_id=?").get(runId) as any;return row?{...row,reconciliationStatus:this.pendingEnrichmentCount(runId)?'provisional':'final',pendingEnrichments:this.pendingEnrichmentCount(runId),input:JSON.parse(row.input_json),prediction:JSON.parse(row.prediction_json),input_json:undefined,prediction_json:undefined}:undefined;}
   resumeDiscoveryRun(id: string): void { const row=this.db.prepare("SELECT source_id,limit_count,mode,worker_count FROM discovery_runs WHERE id=?").get(id) as any;if(!row)throw new Error("Discovery run not found");const claimed=this.claimDiscoveryRun(id,row.source_id??undefined,Number(row.limit_count),undefined,row.mode??'balanced',Number(row.worker_count??6),true);if(!claimed.claimed)throw Object.assign(new Error("A discovery run is already active"),{statusCode:409,activeRun:claimed.activeRun}); }
   finishDiscoveryRun(id: string, result: { status: string; processed: number; employers: number; matching: number; nonmatching: number; errors: number; noNl?: number; empty?: number; retryableErrors?: number; permanentErrors?: number; durationMs?: number; checkpoint?: unknown; fetched?: number; newJobs?: number; refreshedJobs?: number; missingBoards?: number; unsupported?: number; partialCollections?: number; descriptionCandidates?:number; enrichedJobs?:number; deferredEnrichments?:number; descriptionMatches?:number; enrichmentFailures?:number }): void {

@@ -47,10 +47,11 @@ The Overview is the daily starting point. It shows:
 Discovery is the main collection workspace.
 
 1. Choose a 5, 10, 20, or 30 minute run.
-2. Review the expected useful-match range and current source ranking.
-3. Select **Start discovery**.
-4. Watch the live clock, active work, freshness counts, scheduler decisions, and source trace.
-5. Review the completed run, then open new jobs from Overview or Jobs.
+2. Compare the expected fresh strong matches, 80% likely range, chance of finding at least one or five, and matches per minute for every duration.
+3. Review the **Best value** duration and whether running now, in 6 hours, in 12 hours, or tomorrow is materially better.
+4. Select **Start discovery**.
+5. Watch the live clock, active work, freshness counts, scheduler decisions, and source trace.
+6. Review the completed run, then open new jobs from Overview or Jobs.
 
 Only one discovery run can be active at a time. Repeated starts attach to the existing run instead of creating competing collectors. **Cancel safely** stops new work and preserves completed results.
 
@@ -97,26 +98,47 @@ The complete role and eligibility profile lives in [`config/profile.json`](confi
 ## Recommended daily workflow
 
 1. Open Overview and clear jobs in **Needs review**.
-2. Open Discovery and run a 10- or 20-minute search.
-3. Review the run summary, especially new strong matches, useful matches, duplicate rate, and source errors.
+2. Open Discovery and choose the recommended duration, or wait when the expected improvement is material.
+3. Review the run summary, especially fresh strong matches posted within seven days, duplicate rate, and source errors.
 4. Use Jobs to save, decline, or investigate new results.
 5. Move saved roles through Applications and set follow-up dates.
 6. Check Sources when a run looks unexpectedly weak; it shows whether the cause was low supply, repeated results, slow boards, cooldowns, or collection failures.
 
-Longer runs give the scheduler more time to exhaust additional search arms and ATS pages. They do not guarantee proportionally more jobs when the enabled sources have little new inventory.
+Longer runs give the scheduler more time to exhaust additional search arms and ATS pages. Forecasts model diminishing returns, so a 30-minute run is not assumed to produce six times the result of a 5-minute run.
 
 ## How adaptive discovery works
 
-Dashboard discovery optimizes for distinct, newly discovered, strong Netherlands matches with a verified posting date. Its reward weights are:
+Dashboard discovery optimizes for distinct, newly discovered, strong Netherlands matches posted within the last seven days. This is a binary objective:
 
 | Posting age | Reward |
 | --- | ---: |
 | 0-7 days | 1.0 |
-| 8-30 days | 0.4 |
-| 31-60 days | 0.1 |
-| Older or unknown | 0 |
+| More than 7 days | 0 |
+| Unknown, invalid, or future date | 0 |
+
+Matches older than seven days may still be stored and shown as strong matches, but they do not influence source reward, the headline forecast, **Best value**, or waiting advice.
 
 The scheduler considers both acquisition time and the later cost of resolving a board, fetching vacancies, evaluating jobs, and saving results. Repeated candidates, failures, cooling search arms, and slow processing reduce priority. Sparse or new sources retain an exploration allowance so that historical winners do not permanently crowd them out.
+
+### Match forecast and duration recommendation
+
+The Discovery page forecasts all four run durations together. Each option reports:
+
+- expected fresh strong matches;
+- an 80% likely range;
+- the probability of finding at least one and at least five;
+- expected matches per minute; and
+- marginal gain over the preceding duration.
+
+**Best value** is the shortest duration with at least an 80% chance of finding five fresh strong matches. If no duration reaches that threshold, the option with the strongest marginal yield is selected.
+
+The forecast uses only runs from the expected-reward-per-second generation of adaptive discovery. Completed, partial, interrupted, and failed terminal runs can contribute evidence, but incomplete runs use their actual observed exposure rather than their selected duration. Active runs do not enter training until they finish.
+
+The model accounts for recent run yield per productive minute, time since the previous run, per-source recovery, operational reliability, duplicate pressure, diminishing returns, and Amsterdam-local weekday evidence. Older compatible evidence decays gradually over approximately eight weeks. Weekday effects are deliberately restrained until enough observations exist for that weekday.
+
+Forecasts are saved when generated, and the run-start forecast is reconciled with the final fresh-strong outcome. The dashboard labels results **Early estimate** until at least 40 reconciled forecasts demonstrate acceptable 80% interval coverage; only then can it show **Calibrated estimate**.
+
+Waiting advice compares now, 6 hours, 12 hours, and tomorrow. A later time is recommended only when its expected improvement is at least 20% and at least half a match, avoiding false minute-level precision.
 
 LinkedIn Guest and every enabled JobSpy platform receive at least three targeted pulls before normal yield ranking takes over. Current pull sizes are 25 results for LinkedIn Guest, 20 requested results for JobSpy, and 10 candidates for other discovery sources. JobSpy applies its own per-search caps after that request.
 
@@ -126,9 +148,9 @@ At the selected deadline, the scheduler stops launching new work and allows acti
 
 ### What the run counters mean
 
-- **New strong**: a strong Netherlands match first stored during this run.
-- **Reward-eligible**: a distinct strong match with a posting date no more than 60 days old.
-- **Weighted reward**: reward-eligible matches adjusted by the freshness weights above.
+- **Fresh strong ≤7 days**: a strong Netherlands match first stored during this run with a verified posting age of seven days or less. This is the optimized result.
+- **Strong total**: every strong Netherlands match first stored during the run, including matches older than seven days.
+- **Older or unknown-date strong match**: stored and visible, but ignored by the discovery reward and forecast.
 - **Processed**: employer boards or embedded-feed candidates fully evaluated; this is not the number of vacancies returned.
 - **Returned**: raw candidates returned by a source pull.
 - **Uniquely queued**: returned candidates that were not already in the run queue.
